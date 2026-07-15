@@ -17,6 +17,8 @@ final class CleanroomViewModel: ObservableObject {
     private let client = CleanroomAgentClient()
     private var pollingTask: Task<Void, Never>?
     private var started = false
+    private var registrationInProgress = false
+    private var lastRegistrationRepairAt = Date.distantPast
 
     var iconName: String {
         switch status?.phase {
@@ -62,8 +64,12 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     private func refreshAgentRegistration(force: Bool = false) async {
+        guard !registrationInProgress else { return }
+        registrationInProgress = true
+        defer { registrationInProgress = false }
+
         let service = SMAppService.agent(plistName: "com.rex.cleanroom.agent.plist")
-        let digest = currentAgentDigest()
+        let digest = currentRegistrationDigest()
         let registeredDigest = UserDefaults.standard.string(forKey: "registeredAgentDigest")
         do {
             switch service.status {
@@ -94,11 +100,25 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
-    private func currentAgentDigest() -> String? {
-        let agentURL = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/Library/LaunchServices/cleanroom-agent")
-        guard let data = try? Data(contentsOf: agentURL, options: .mappedIfSafe) else { return nil }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    private func currentRegistrationDigest() -> String? {
+        let bundleURL = Bundle.main.bundleURL
+        let urls = [
+            Bundle.main.executableURL,
+            bundleURL.appendingPathComponent("Contents/Library/LaunchServices/cleanroom-agent"),
+            bundleURL.appendingPathComponent("Contents/Library/LaunchAgents/com.rex.cleanroom.agent.plist"),
+            bundleURL.appendingPathComponent("Contents/Info.plist"),
+            bundleURL.appendingPathComponent("Contents/_CodeSignature/CodeResources"),
+        ].compactMap { $0 }
+
+        var hasher = SHA256()
+        var hashedFileCount = 0
+        for url in urls {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { continue }
+            hasher.update(data: data)
+            hashedFileCount += 1
+        }
+        guard hashedFileCount >= 2 else { return nil }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     func openLoginItemsSettings() {
@@ -115,6 +135,10 @@ final class CleanroomViewModel: ObservableObject {
         } catch {
             connectionMessage = "Agent unavailable: \(error.localizedDescription)"
             await client.invalidate()
+            if Date().timeIntervalSince(lastRegistrationRepairAt) >= 30 {
+                lastRegistrationRepairAt = Date()
+                await refreshAgentRegistration(force: true)
+            }
         }
     }
 

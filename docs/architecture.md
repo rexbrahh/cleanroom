@@ -1,0 +1,54 @@
+# Architecture
+
+## Processes
+
+- `Cleanroom.app`: SwiftUI menu-bar status, settings, preflight, and recovery UX.
+- `cleanroom-agent`: LaunchAgent and sole owner of cleanroom state.
+- `cleanroomctl`: command-line XPC client.
+
+All targets share `CleanroomCore`. macOS-specific inspection and mutation live
+behind protocols in `CleanroomMac`.
+
+The app registers the agent with `SMAppService`. It fingerprints the embedded
+helper and refreshes registration when an installed helper changes, as required
+by Service Management for updated LaunchAgent executables. The CLI and app use
+one per-user Mach service; neither process mutates cleanroom state directly.
+
+## Safety invariants
+
+1. Save and validate a complete recovery journal before the first mutation.
+2. Serialize transitions through one actor.
+3. Treat unreadable system state as unknown and refuse unsafe mutation.
+4. Clear the journal only after every required restore postcondition succeeds.
+5. Restore only helpers and settings recorded before entry.
+6. Keep system services, network extensions, VPN daemons, Time Machine, and
+   Karabiner's DriverKit services operator-controlled.
+
+## V1 state machine
+
+`idle -> entering -> active -> restoring -> idle`
+
+Any failed or unknown postcondition enters `degraded`. Recovery can retry entry,
+retry restoration, or explicitly discard the journal after user confirmation.
+
+## Gameplay policy
+
+The fixed Phantom Forces profile snapshots and temporarily changes:
+
+- mouse linearity, external-mouse trackpad gating, and the bottom-right hot corner;
+- `skhd`, `yabai`, and JankyBorders;
+- the configured input, window, launcher, capture, overlay, and background apps.
+
+The preflight reports high CPU consumers, VM/container workloads, recording and
+sync clients, Karabiner/VirtualHID, external pointer availability, Time Machine,
+VPN/default-route state, Little Snitch residency, power source, Low Power Mode,
+and thermal pressure. Network extensions, VPN daemons, Time Machine, VMs, and
+Karabiner DriverKit services remain operator-controlled.
+
+## Runtime cost
+
+Roblox presence and managed application state use `NSRunningApplication`.
+Steady idle monitoring launches no AppleScript or shell probes. Heartbeat writes
+are bounded to one every five seconds, event diagnostics are capped at 512 KiB,
+and the active drift verifier runs every fifteen seconds. Stop and restore work
+for independent helpers is launched concurrently.

@@ -1,9 +1,12 @@
+import AppKit
 import CleanroomCore
 import CleanroomProtocol
 import Combine
 import CryptoKit
 import Foundation
 import ServiceManagement
+import UniformTypeIdentifiers
+import UserNotifications
 
 @MainActor
 final class CleanroomViewModel: ObservableObject {
@@ -14,6 +17,10 @@ final class CleanroomViewModel: ObservableObject {
     @Published var registrationMessage = "Checking background-agent registration…"
     @Published var presentingDiscardConfirmation = false
     @Published var recentEvents: [TransitionReport] = []
+    @Published var notificationsEnabled: Bool
+    @Published var notificationMessage = "Gameplay notifications are off"
+    @Published var launchAtLoginEnabled: Bool
+    @Published var launchAtLoginMessage = "Menu-bar launch at login is off"
 
     private let client = CleanroomAgentClient()
     private var pollingTask: Task<Void, Never>?
@@ -21,6 +28,19 @@ final class CleanroomViewModel: ObservableObject {
     private var registrationInProgress = false
     private var lastRegistrationRepairAt = Date.distantPast
     private var statusPollCount = 0
+    private var previousPhase: CleanroomPhase?
+
+    private static let notificationsPreferenceKey = "recoveryNotificationsEnabled"
+
+    init() {
+        notificationsEnabled = UserDefaults.standard.bool(
+            forKey: Self.notificationsPreferenceKey
+        )
+        launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+        if launchAtLoginEnabled {
+            launchAtLoginMessage = "Menu-bar app launches at login"
+        }
+    }
 
     enum AgentHealth {
         case connecting
@@ -31,7 +51,13 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     var iconName: String {
-        switch status?.phase {
+        switch agentHealth {
+        case .stale, .unavailable:
+            return "exclamationmark.triangle.fill"
+        case .connecting, .healthy, .delayed:
+            break
+        }
+        return switch status?.phase {
         case .active: "scope"
         case .entering, .restoring: "arrow.triangle.2.circlepath"
         case .degraded: "exclamationmark.triangle.fill"
@@ -91,11 +117,18 @@ final class CleanroomViewModel: ObservableObject {
         return "Ready"
     }
 
+    var appVersion: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        return "\(version ?? "development") (\(build ?? "local"))"
+    }
+
     func start() {
         guard !started else { return }
         started = true
         Task { [weak self] in
             await self?.refreshAgentRegistration()
+            await self?.refreshNotificationAuthorization()
         }
         pollingTask = Task { [weak self] in
             guard let self else { return }
@@ -181,6 +214,7 @@ final class CleanroomViewModel: ObservableObject {
             self.status = status
             self.preflight = status.preflight ?? preflight
             connectionMessage = status.lastMessage
+            handlePhaseTransition(to: status.phase)
             statusPollCount += 1
             if statusPollCount == 1 || statusPollCount.isMultiple(of: 5) {
                 await refreshEvents()
@@ -237,6 +271,80 @@ final class CleanroomViewModel: ObservableObject {
         perform(.migrateLegacy)
     }
 
+    func setNotificationsEnabled(_ enabled: Bool) {
+        if !enabled {
+            notificationsEnabled = false
+            UserDefaults.standard.set(false, forKey: Self.notificationsPreferenceKey)
+            notificationMessage = "Gameplay notifications are off"
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let granted = try await UNUserNotificationCenter.current().requestAuthorization(
+                    options: [.alert, .sound]
+                )
+                notificationsEnabled = granted
+                UserDefaults.standard.set(granted, forKey: Self.notificationsPreferenceKey)
+                notificationMessage =
+                    granted
+                    ? "Recovery and degraded-state notifications are on"
+                    : "Notification permission was denied"
+            } catch {
+                notificationsEnabled = false
+                UserDefaults.standard.set(false, forKey: Self.notificationsPreferenceKey)
+                notificationMessage = "Notification setup failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                if enabled {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try await SMAppService.mainApp.unregister()
+                }
+                launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+                launchAtLoginMessage =
+                    launchAtLoginEnabled
+                    ? "Menu-bar app launches at login"
+                    : "Menu-bar launch at login is off"
+            } catch {
+                launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+                launchAtLoginMessage = "Login-item change failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func copyDiagnostics() {
+        do {
+            let text = String(decoding: try diagnosticData(), as: UTF8.self)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            connectionMessage = "Diagnostics copied to the clipboard."
+        } catch {
+            connectionMessage = "Diagnostics copy failed: \(error.localizedDescription)"
+        }
+    }
+
+    func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.title = "Export Cleanroom Diagnostics"
+        panel.nameFieldStringValue = "Cleanroom-diagnostics.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try diagnosticData().write(to: url, options: .atomic)
+            connectionMessage = "Diagnostics exported to \(url.lastPathComponent)."
+        } catch {
+            connectionMessage = "Diagnostics export failed: \(error.localizedDescription)"
+        }
+    }
+
     private func perform(_ command: AgentCommand) {
         guard !operationInProgress else { return }
         operationInProgress = true
@@ -265,5 +373,76 @@ final class CleanroomViewModel: ObservableObject {
                 await client.invalidate()
             }
         }
+    }
+
+    private func refreshNotificationAuthorization() async {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        if settings.authorizationStatus == .denied {
+            notificationsEnabled = false
+            UserDefaults.standard.set(false, forKey: Self.notificationsPreferenceKey)
+            notificationMessage = "Notification permission is denied in System Settings"
+        } else if notificationsEnabled {
+            notificationMessage = "Recovery and degraded-state notifications are on"
+        }
+    }
+
+    private func handlePhaseTransition(to phase: CleanroomPhase) {
+        defer { previousPhase = phase }
+        guard let previousPhase, previousPhase != phase, notificationsEnabled else { return }
+
+        switch phase {
+        case .degraded:
+            deliverNotification(
+                title: "Cleanroom needs attention",
+                body: status?.lastMessage ?? "Recovery or entry verification needs attention."
+            )
+        case .idle where previousPhase == .restoring || previousPhase == .active:
+            deliverNotification(
+                title: "Cleanroom restored",
+                body: "Saved desktop and input state has been restored."
+            )
+        case .idle, .entering, .active, .restoring, .paused:
+            break
+        }
+    }
+
+    private func deliverNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.notificationMessage = "Notification delivery failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func diagnosticData() throws -> Data {
+        struct DiagnosticSnapshot: Encodable {
+            let generatedAt: Date
+            let appVersion: String
+            let status: CleanroomStatus?
+            let preflight: PreflightReport?
+            let recentEvents: [TransitionReport]
+            let networkMutationPolicy: String
+        }
+
+        return try AgentCodec.encode(
+            DiagnosticSnapshot(
+                generatedAt: Date(),
+                appVersion: appVersion,
+                status: status,
+                preflight: preflight,
+                recentEvents: recentEvents,
+                networkMutationPolicy: "read-only preflight; no network mutation"
+            )
+        )
     }
 }

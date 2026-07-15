@@ -13,6 +13,8 @@ The app registers the agent with `SMAppService`. It fingerprints the embedded
 helper and refreshes registration when an installed helper changes, as required
 by Service Management for updated LaunchAgent executables. The CLI and app use
 one per-user Mach service; neither process mutates cleanroom state directly.
+The menu app can register itself as a login item independently; that setting
+does not change the recovery agent's registration or state.
 
 ## Safety invariants
 
@@ -56,3 +58,11 @@ Steady idle monitoring launches no AppleScript or shell probes. Heartbeat writes
 are bounded to one every five seconds, event diagnostics are capped at 512 KiB,
 and the active drift verifier runs every fifteen seconds. Stop and restore work
 for independent helpers is launched concurrently.
+
+## Presentation settings
+
+Menu-app launch-at-login and notification consent live in the app's user
+defaults. Pause intent lives in the agent-owned application-support directory
+and is loaded before reconciliation begins. Notifications are opt-in and cover
+only degraded transitions and completed restoration, avoiding activation
+banners during gameplay.

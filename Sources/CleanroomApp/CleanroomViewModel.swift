@@ -6,7 +6,7 @@ import CryptoKit
 import Foundation
 import ServiceManagement
 import UniformTypeIdentifiers
-import UserNotifications
+@preconcurrency import UserNotifications
 
 @MainActor
 final class CleanroomViewModel: ObservableObject {

@@ -77,6 +77,28 @@ struct CleanroomEngineTests {
         #expect(!(await store.journalExists()))
     }
 
+    @Test("failed restore waits for explicit recovery instead of retrying")
+    func failedRestoreDoesNotLoop() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace, journal: .fixture)
+        let system = FakeSystem(trace: trace, restoreFails: true, triggerState: .stopped)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store
+        )
+
+        let first = await engine.restore()
+        let automatic = await engine.reconcile()
+
+        #expect(first.phase == .degraded)
+        #expect(automatic.phase == .degraded)
+        #expect(await trace.count(of: "restore") == 1)
+
+        _ = await engine.recover(.retryRestore)
+        #expect(await trace.count(of: "restore") == 2)
+    }
+
     @Test("unknown trigger state blocks entry")
     func unknownTriggerBlocksEntry() async throws {
         let trace = Trace()

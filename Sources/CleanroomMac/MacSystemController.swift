@@ -460,15 +460,26 @@ public actor MacSystemController: CleanroomSystemControlling {
         let target = "\(stored.domain):\(stored.key)"
         let arguments: [String]
         if stored.wasPresent, let value = stored.value {
-            arguments = ["write", stored.domain, stored.key, defaultsFlag(stored.kind), value]
+            arguments = [
+                "write", stored.domain, stored.key, defaultsFlag(stored.kind),
+                defaultsWriteValue(value, kind: stored.kind),
+            ]
         } else {
             arguments = ["delete", stored.domain, stored.key]
         }
         let result = await commands.run("/usr/bin/defaults", arguments: arguments, timeout: 3)
-        let deletionAlreadySatisfied =
-            !stored.wasPresent
-            && !result.succeeded
-            && ("\(result.standardOutput)\n\(result.standardError)".lowercased().contains("does not exist"))
+        var deletionAlreadySatisfied = false
+        if !stored.wasPresent, !result.succeeded {
+            let action = PreferenceAction(
+                domain: stored.domain,
+                key: stored.key,
+                kind: stored.kind,
+                activeValue: ""
+            )
+            if let actual = try? await readPreference(action) {
+                deletionAlreadySatisfied = !actual.wasPresent
+            }
+        }
         return ActionResult(
             action: "restore preference",
             target: target,
@@ -1048,6 +1059,11 @@ public actor MacSystemController: CleanroomSystemControlling {
         case .integer: "-int"
         case .string: "-string"
         }
+    }
+
+    private func defaultsWriteValue(_ value: String, kind: PreferenceKind) -> String {
+        guard kind == .boolean, let boolean = normalizeBoolean(value) else { return value }
+        return boolean ? "true" : "false"
     }
 
     private func valuesMatch(_ lhs: String?, _ rhs: String?, kind: PreferenceKind) -> Bool {

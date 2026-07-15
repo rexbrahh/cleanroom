@@ -156,14 +156,18 @@ final class CleanroomViewModel: ObservableObject {
         do {
             switch service.status {
             case .enabled:
-                if force || digest == nil || registeredDigest != digest {
+                if digest == nil || registeredDigest != digest {
                     registrationMessage = "Refreshing background-agent registration…"
                     try await service.unregister()
+                    try await Task.sleep(for: .seconds(1))
                     try service.register()
                     if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
                     registrationMessage = "Background agent updated and enabled"
                 } else {
-                    registrationMessage = "Background agent enabled"
+                    registrationMessage =
+                        force
+                        ? "Background agent is registered; connection recovery is pending"
+                        : "Background agent enabled"
                 }
             case .requiresApproval:
                 registrationMessage = "Background agent requires approval in Login Items"

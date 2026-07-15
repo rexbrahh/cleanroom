@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.0.1
+
+- Canonicalizes saved numeric booleans to `true` or `false` before invoking
+  macOS `defaults` during restoration.
+- Treats a failed preference deletion as successful when a follow-up read
+  verifies the saved absent state.
+- Suppresses automatic mutation retries after a degraded entry, drift repair,
+  or restore; recovery resumes only after an explicit user action.
+- Serializes Service Management unregister/register refreshes and prevents
+  connection polling from repeatedly replacing an already-current registration.
+
 ## 3.0.0
 
 - Adds a multi-section native dashboard for overview, preflight, activity, and

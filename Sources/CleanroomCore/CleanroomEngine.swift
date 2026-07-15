@@ -10,6 +10,7 @@ public actor CleanroomEngine {
     private var lastResults: [ActionResult] = []
     private var latestPreflight: PreflightReport?
     private var paused = false
+    private var automaticRetrySuppressed = false
 
     public init(
         profile: CleanroomProfile,
@@ -70,6 +71,16 @@ public actor CleanroomEngine {
 
     @discardableResult
     public func reconcile() async -> TransitionReport {
+        if automaticRetrySuppressed {
+            phase = .degraded
+            return TransitionReport(
+                phase: .degraded,
+                message: lastMessage,
+                results: lastResults,
+                preflight: latestPreflight
+            )
+        }
+
         if paused {
             let trigger = await system.probeTrigger()
             if await journalStore.journalExists() {
@@ -125,13 +136,17 @@ public actor CleanroomEngine {
             }
             journal = loaded
         } catch {
-            return degrade(error.localizedDescription)
+            return degrade(error.localizedDescription, suppressAutomaticRetry: true)
         }
 
         phase = .restoring
         let results = await system.restore(snapshot: journal.snapshot, profile: profile)
         if results.contains(where: { $0.outcome.blocksCompletion }) {
-            return degrade("Restoration is incomplete; the recovery journal was retained.", results: results)
+            return degrade(
+                "Restoration is incomplete; automatic retries are paused and the recovery journal was retained.",
+                results: results,
+                suppressAutomaticRetry: true
+            )
         }
 
         do {
@@ -141,6 +156,7 @@ public actor CleanroomEngine {
         }
 
         phase = .idle
+        automaticRetrySuppressed = false
         lastMessage = "Saved desktop and input state restored."
         lastResults = results
         return TransitionReport(phase: phase, message: lastMessage, results: results)
@@ -191,7 +207,11 @@ public actor CleanroomEngine {
         var results = await system.apply(profile: profile)
         results.append(contentsOf: await system.verifyApplied(profile: profile))
         if results.contains(where: { $0.outcome.blocksCompletion }) {
-            return degrade("Cleanroom drift repair failed; recovery state was retained.", results: results)
+            return degrade(
+                "Cleanroom drift repair failed; automatic retries are paused and recovery state was retained.",
+                results: results,
+                suppressAutomaticRetry: true
+            )
         }
 
         phase = .active
@@ -204,13 +224,16 @@ public actor CleanroomEngine {
     public func recover(_ action: RecoveryAction) async -> TransitionReport {
         switch action {
         case .retryEntry:
+            automaticRetrySuppressed = false
             return await enter(force: true)
         case .retryRestore:
+            automaticRetrySuppressed = false
             return await restore()
         case .discardJournal:
             do {
                 try await journalStore.clearJournal()
                 phase = .idle
+                automaticRetrySuppressed = false
                 lastMessage = "Recovery journal discarded by explicit user action."
                 lastResults = []
                 return TransitionReport(phase: phase, message: lastMessage)
@@ -235,7 +258,7 @@ public actor CleanroomEngine {
         do {
             existingJournal = try await journalStore.loadJournal()
         } catch {
-            return degrade(error.localizedDescription)
+            return degrade(error.localizedDescription, suppressAutomaticRetry: true)
         }
 
         if existingJournal != nil, phase == .active, !force {
@@ -269,7 +292,7 @@ public actor CleanroomEngine {
                 let journal = RecoveryJournal(trigger: process, snapshot: snapshot)
                 try await journalStore.saveJournal(journal)
             } catch {
-                return degrade(error.localizedDescription)
+                return degrade(error.localizedDescription, suppressAutomaticRetry: true)
             }
         }
 
@@ -277,10 +300,15 @@ public actor CleanroomEngine {
         var results = await system.apply(profile: profile)
         results.append(contentsOf: await system.verifyApplied(profile: profile))
         if results.contains(where: { $0.outcome.blocksCompletion }) {
-            return degrade("Cleanroom entry verification failed; recovery state was retained.", results: results)
+            return degrade(
+                "Cleanroom entry verification failed; automatic retries are paused and recovery state was retained.",
+                results: results,
+                suppressAutomaticRetry: true
+            )
         }
 
         phase = .active
+        automaticRetrySuppressed = false
         lastMessage =
             existingJournal == nil
             ? "Roblox cleanroom entered."
@@ -294,8 +322,15 @@ public actor CleanroomEngine {
         )
     }
 
-    private func degrade(_ message: String, results: [ActionResult] = []) -> TransitionReport {
+    private func degrade(
+        _ message: String,
+        results: [ActionResult] = [],
+        suppressAutomaticRetry: Bool = false
+    ) -> TransitionReport {
         phase = .degraded
+        if suppressAutomaticRetry {
+            automaticRetrySuppressed = true
+        }
         lastMessage = message
         lastResults = results
         return TransitionReport(

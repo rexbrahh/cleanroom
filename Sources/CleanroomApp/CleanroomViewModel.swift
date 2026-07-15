@@ -13,12 +13,22 @@ final class CleanroomViewModel: ObservableObject {
     @Published var connectionMessage = "Starting Cleanroom agent…"
     @Published var registrationMessage = "Checking background-agent registration…"
     @Published var presentingDiscardConfirmation = false
+    @Published var recentEvents: [TransitionReport] = []
 
     private let client = CleanroomAgentClient()
     private var pollingTask: Task<Void, Never>?
     private var started = false
     private var registrationInProgress = false
     private var lastRegistrationRepairAt = Date.distantPast
+    private var statusPollCount = 0
+
+    enum AgentHealth {
+        case connecting
+        case healthy
+        case delayed
+        case stale
+        case unavailable
+    }
 
     var iconName: String {
         switch status?.phase {
@@ -40,6 +50,45 @@ final class CleanroomViewModel: ObservableObject {
         case .idle: "Watching for Roblox"
         case nil: "Connecting to agent"
         }
+    }
+
+    var agentHealth: AgentHealth {
+        guard status != nil else {
+            return connectionMessage.hasPrefix("Agent unavailable") ? .unavailable : .connecting
+        }
+        guard let heartbeatAt = status?.heartbeatAt else { return .delayed }
+        let age = Date().timeIntervalSince(heartbeatAt)
+        if age <= 12 { return .healthy }
+        if age <= 30 { return .delayed }
+        return .stale
+    }
+
+    var agentHealthTitle: String {
+        switch agentHealth {
+        case .connecting: "Connecting"
+        case .healthy: "Healthy"
+        case .delayed: "Heartbeat delayed"
+        case .stale: "Heartbeat stale"
+        case .unavailable: "Unavailable"
+        }
+    }
+
+    var sessionDetail: String {
+        guard let journal = status?.journal else { return "No saved gameplay session" }
+        let elapsed = max(0, Int(Date().timeIntervalSince(journal.createdAt)))
+        let hours = elapsed / 3_600
+        let minutes = (elapsed % 3_600) / 60
+        if hours > 0 { return "Session \(hours)h \(minutes)m · recovery armed" }
+        return "Session \(minutes)m · recovery armed"
+    }
+
+    var preflightSummary: String {
+        guard let findings = preflight?.findings else { return "Preflight has not run" }
+        let critical = findings.count { $0.severity == .critical }
+        let warnings = findings.count { $0.severity == .warning }
+        if critical > 0 { return "\(critical) critical · \(warnings) warnings" }
+        if warnings > 0 { return "\(warnings) warnings" }
+        return "Ready"
     }
 
     func start() {
@@ -132,6 +181,10 @@ final class CleanroomViewModel: ObservableObject {
             self.status = status
             self.preflight = status.preflight ?? preflight
             connectionMessage = status.lastMessage
+            statusPollCount += 1
+            if statusPollCount == 1 || statusPollCount.isMultiple(of: 5) {
+                await refreshEvents()
+            }
         } catch {
             connectionMessage = "Agent unavailable: \(error.localizedDescription)"
             await client.invalidate()
@@ -139,6 +192,16 @@ final class CleanroomViewModel: ObservableObject {
                 lastRegistrationRepairAt = Date()
                 await refreshAgentRegistration(force: true)
             }
+        }
+    }
+
+    func refreshEvents() async {
+        do {
+            let response = try await client.send(.recentEvents(limit: 30))
+            guard case .events(let events) = response.payload else { return }
+            recentEvents = events.reversed()
+        } catch {
+            await client.invalidate()
         }
     }
 
@@ -191,8 +254,10 @@ final class CleanroomViewModel: ObservableObject {
                 case .preflight(let report):
                     preflight = report
                     connectionMessage = "Competitive preflight completed."
-                case .events, .failure:
-                    break
+                case .events(let events):
+                    recentEvents = events.reversed()
+                case .failure(let message):
+                    connectionMessage = message
                 }
                 await refreshStatus()
             } catch {

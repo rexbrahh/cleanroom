@@ -67,6 +67,7 @@ private struct DashboardView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
+                healthCard
                 agentCard
                 if model.status?.phase == .degraded || model.status?.journal != nil {
                     recoveryCard
@@ -74,6 +75,7 @@ private struct DashboardView: View {
                 controls
                 preflightCard
                 recentResults
+                activityCard
             }
             .padding(24)
         }
@@ -85,6 +87,46 @@ private struct DashboardView: View {
                 "Only discard after manually confirming that pointer, trackpad, hot-corner, app, and window-management state has already been restored."
             )
         }
+    }
+
+    private var healthCard: some View {
+        HStack(spacing: 12) {
+            metric(
+                title: "Agent",
+                value: model.agentHealthTitle,
+                systemImage: model.agentHealth == .healthy ? "checkmark.circle.fill" : "waveform.path.ecg",
+                tint: agentHealthColor
+            )
+            metric(
+                title: "Session",
+                value: model.sessionDetail,
+                systemImage: model.status?.journal == nil ? "lock.open" : "lock.shield.fill",
+                tint: model.status?.journal == nil ? .secondary : .green
+            )
+            metric(
+                title: "Readiness",
+                value: model.preflightSummary,
+                systemImage: "checklist",
+                tint: readinessColor
+            )
+        }
+    }
+
+    private func metric(title: String, value: String, systemImage: String, tint: Color) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: systemImage)
+                .foregroundStyle(tint)
+                .font(.title3)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                Text(value).font(.callout.weight(.medium)).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 68, alignment: .topLeading)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var header: some View {
@@ -220,6 +262,78 @@ private struct DashboardView: View {
                 }
                 .padding(.vertical, 4)
             }
+        }
+    }
+
+    private var activityCard: some View {
+        GroupBox("Activity") {
+            if model.recentEvents.isEmpty {
+                Text("No recorded transitions yet.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(model.recentEvents.prefix(10).enumerated()), id: \.offset) { _, event in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Image(systemName: eventIcon(event.phase))
+                                .foregroundStyle(eventColor(event.phase))
+                                .frame(width: 18)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(event.message).font(.callout.weight(.medium))
+                                HStack(spacing: 6) {
+                                    Text(event.phase.rawValue.capitalized)
+                                    if let occurredAt = event.occurredAt {
+                                        Text("·")
+                                        Text(occurredAt.formatted(date: .abbreviated, time: .standard))
+                                    }
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                        if event != model.recentEvents.prefix(10).last { Divider() }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    private var agentHealthColor: Color {
+        switch model.agentHealth {
+        case .healthy: .green
+        case .connecting, .delayed: .orange
+        case .stale, .unavailable: .red
+        }
+    }
+
+    private var readinessColor: Color {
+        switch model.preflight?.highestSeverity {
+        case .critical: .red
+        case .warning: .orange
+        case .information: .green
+        case nil: .secondary
+        }
+    }
+
+    private func eventIcon(_ phase: CleanroomPhase) -> String {
+        switch phase {
+        case .active: "scope"
+        case .degraded: "exclamationmark.triangle.fill"
+        case .paused: "pause.circle.fill"
+        case .entering, .restoring: "arrow.triangle.2.circlepath"
+        case .idle: "checkmark.circle"
+        }
+    }
+
+    private func eventColor(_ phase: CleanroomPhase) -> Color {
+        switch phase {
+        case .active: .green
+        case .degraded: .red
+        case .paused: .orange
+        case .entering, .restoring: .blue
+        case .idle: .secondary
         }
     }
 

@@ -8,13 +8,18 @@ actor AgentRuntime {
     private let controller: MacSystemController
     private let engine: CleanroomEngine
     private let diagnostics: DiagnosticsStore
+    private let preferencesStore: any RuntimePreferencesPersisting
     private let logger = Logger(subsystem: "com.rex.cleanroom", category: "agent")
     private let startedAt = Date()
     private var heartbeatAt: Date?
     private var monitorTask: Task<Void, Never>?
     private var lastEventSignature = ""
+    private var preferencesLoaded = false
 
-    init(controller: MacSystemController) {
+    init(
+        controller: MacSystemController,
+        preferencesStore: any RuntimePreferencesPersisting = FileRuntimePreferencesStore()
+    ) {
         self.controller = controller
         self.engine = CleanroomEngine(
             profile: .phantomForces(),
@@ -22,6 +27,7 @@ actor AgentRuntime {
             journalStore: FileRecoveryJournalStore()
         )
         self.diagnostics = DiagnosticsStore()
+        self.preferencesStore = preferencesStore
     }
 
     func startMonitoring() {
@@ -32,6 +38,7 @@ actor AgentRuntime {
     }
 
     func handle(_ request: AgentRequest) async -> AgentResponse {
+        await loadPreferencesIfNeeded()
         switch request.command {
         case .status:
             let status = await engine.status(
@@ -49,6 +56,16 @@ actor AgentRuntime {
             let report = await engine.preflight()
             return AgentResponse(requestIdentifier: request.identifier, payload: .preflight(report))
         case .setPaused(let paused):
+            do {
+                try await preferencesStore.savePreferences(
+                    RuntimePreferences(automaticTransitionsPaused: paused)
+                )
+            } catch {
+                return AgentResponse(
+                    requestIdentifier: request.identifier,
+                    payload: .failure("Pause preference was not changed: \(error.localizedDescription)")
+                )
+            }
             await engine.setPaused(paused)
             let status = await engine.status(agentStartedAt: startedAt, heartbeatAt: heartbeatAt)
             let report = TransitionReport(
@@ -79,6 +96,7 @@ actor AgentRuntime {
     }
 
     private func monitorLoop() async {
+        await loadPreferencesIfNeeded()
         var lastDriftCheck = Date.distantPast
         var lastHeartbeatWrite = Date.distantPast
         while !Task.isCancelled {
@@ -95,6 +113,22 @@ actor AgentRuntime {
                 lastHeartbeatWrite = Date()
             }
             try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    private func loadPreferencesIfNeeded() async {
+        guard !preferencesLoaded else { return }
+        preferencesLoaded = true
+        do {
+            let preferences = try await preferencesStore.loadPreferences()
+            if preferences.automaticTransitionsPaused {
+                await engine.setPaused(true)
+            }
+        } catch {
+            await engine.setPaused(true)
+            logger.error(
+                "Runtime preferences are unreadable; automatic transitions were paused: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

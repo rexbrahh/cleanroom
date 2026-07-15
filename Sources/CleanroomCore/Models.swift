@@ -283,17 +283,20 @@ public struct TransitionReport: Codable, Equatable, Sendable {
     public let message: String
     public let results: [ActionResult]
     public let preflight: PreflightReport?
+    public let occurredAt: Date?
 
     public init(
         phase: CleanroomPhase,
         message: String,
         results: [ActionResult] = [],
-        preflight: PreflightReport? = nil
+        preflight: PreflightReport? = nil,
+        occurredAt: Date? = Date()
     ) {
         self.phase = phase
         self.message = message
         self.results = results
         self.preflight = preflight
+        self.occurredAt = occurredAt
     }
 }
 
@@ -342,6 +345,7 @@ public enum CleanroomError: Error, Equatable, LocalizedError, Sendable {
     case noRecoveryJournal
     case mutationFailed(String)
     case persistenceFailed(String)
+    case invalidRuntimePreferences(String)
 
     public var errorDescription: String? {
         switch self {
@@ -359,6 +363,8 @@ public enum CleanroomError: Error, Equatable, LocalizedError, Sendable {
             "Cleanroom mutation failed: \(detail)"
         case .persistenceFailed(let detail):
             "Cleanroom persistence failed: \(detail)"
+        case .invalidRuntimePreferences(let detail):
+            "Invalid runtime preferences: \(detail)"
         }
     }
 }

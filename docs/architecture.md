@@ -24,7 +24,11 @@ one per-user Mach service; neither process mutates cleanroom state directly.
 6. Keep system services, network extensions, VPN daemons, Time Machine, and
    Karabiner's DriverKit services operator-controlled.
 
-## V1 state machine
+The same boundary applies to Tailscale, Little Snitch, firewalls, DNS, routes,
+interfaces, and other network extensions. Network probes are read-only and no
+network component may appear in the fixed profile's mutation set.
+
+## State machine
 
 `idle -> entering -> active -> restoring -> idle`
 

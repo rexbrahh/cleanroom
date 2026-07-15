@@ -22,10 +22,15 @@ struct CleanroomApp: App {
 
         Window("Cleanroom", id: "dashboard") {
             DashboardView(model: model)
-                .frame(minWidth: 620, minHeight: 560)
+                .frame(minWidth: 760, minHeight: 580)
                 .task { model.start() }
         }
-        .defaultSize(width: 680, height: 680)
+        .defaultSize(width: 900, height: 700)
+
+        Settings {
+            CleanroomSettingsView(model: model)
+                .frame(width: 520)
+        }
     }
 }
 
@@ -54,6 +59,10 @@ private struct CleanroomMenu: View {
                 openWindow(id: "dashboard")
                 NSApplication.shared.activate(ignoringOtherApps: true)
             }
+            SettingsLink {
+                Text("Settings…")
+            }
+            Divider()
             Button("Quit Menu Bar App") { NSApplication.shared.terminate(nil) }
         }
         .onAppear { model.start() }
@@ -62,20 +71,24 @@ private struct CleanroomMenu: View {
 
 private struct DashboardView: View {
     @ObservedObject var model: CleanroomViewModel
+    @State private var selectedSection: DashboardSection? = .overview
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-                agentCard
-                if model.status?.phase == .degraded || model.status?.journal != nil {
-                    recoveryCard
-                }
-                controls
-                preflightCard
-                recentResults
+        NavigationSplitView {
+            List(DashboardSection.allCases, selection: $selectedSection) { section in
+                Label(section.title, systemImage: section.systemImage)
+                    .tag(section)
             }
-            .padding(24)
+            .navigationTitle("Cleanroom")
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 220)
+        } detail: {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header
+                    sectionContent
+                }
+                .padding(24)
+            }
         }
         .alert("Discard recovery journal?", isPresented: $model.presentingDiscardConfirmation) {
             Button("Cancel", role: .cancel) {}
@@ -85,6 +98,80 @@ private struct DashboardView: View {
                 "Only discard after manually confirming that pointer, trackpad, hot-corner, app, and window-management state has already been restored."
             )
         }
+    }
+
+    @ViewBuilder
+    private var sectionContent: some View {
+        switch selectedSection ?? .overview {
+        case .overview:
+            healthCard
+            agentCard
+            if model.status?.phase == .degraded || model.status?.journal != nil {
+                recoveryCard
+            }
+            controls
+            recentResults
+        case .preflight:
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Competitive readiness").font(.headline)
+                    Text("Read-only inspection of input, load, power, thermals, and networking.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Run Preflight") { model.runPreflight() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.operationInProgress)
+            }
+            preflightCard
+        case .activity:
+            recentResults
+            activityCard
+            diagnosticsCard
+        case .policy:
+            policyCard
+        }
+    }
+
+    private var healthCard: some View {
+        HStack(spacing: 12) {
+            metric(
+                title: "Agent",
+                value: model.agentHealthTitle,
+                systemImage: model.agentHealth == .healthy ? "checkmark.circle.fill" : "waveform.path.ecg",
+                tint: agentHealthColor
+            )
+            metric(
+                title: "Session",
+                value: model.sessionDetail,
+                systemImage: model.status?.journal == nil ? "lock.open" : "lock.shield.fill",
+                tint: model.status?.journal == nil ? .secondary : .green
+            )
+            metric(
+                title: "Readiness",
+                value: model.preflightSummary,
+                systemImage: "checklist",
+                tint: readinessColor
+            )
+        }
+    }
+
+    private func metric(title: String, value: String, systemImage: String, tint: Color) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: systemImage)
+                .foregroundStyle(tint)
+                .font(.title3)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                Text(value).font(.callout.weight(.medium)).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 68, alignment: .topLeading)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var header: some View {
@@ -223,6 +310,166 @@ private struct DashboardView: View {
         }
     }
 
+    private var activityCard: some View {
+        GroupBox("Activity") {
+            if model.recentEvents.isEmpty {
+                Text("No recorded transitions yet.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(model.recentEvents.prefix(10).enumerated()), id: \.offset) { _, event in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Image(systemName: eventIcon(event.phase))
+                                .foregroundStyle(eventColor(event.phase))
+                                .frame(width: 18)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(event.message).font(.callout.weight(.medium))
+                                HStack(spacing: 6) {
+                                    Text(event.phase.rawValue.capitalized)
+                                    if let occurredAt = event.occurredAt {
+                                        Text("·")
+                                        Text(occurredAt.formatted(date: .abbreviated, time: .standard))
+                                    }
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                        if event != model.recentEvents.prefix(10).last { Divider() }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    private var diagnosticsCard: some View {
+        GroupBox("Diagnostics") {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Status, preflight, and the latest bounded transition history")
+                    Text("The export records that network checks are observation-only.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Copy JSON") { model.copyDiagnostics() }
+                Button("Export…") { model.exportDiagnostics() }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private var policyCard: some View {
+        let profile = CleanroomProfile.phantomForces()
+        return VStack(alignment: .leading, spacing: 16) {
+            GroupBox("Managed automatically") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(
+                        "Only these fixed desktop and input targets can be stopped or changed. Previously running targets are restored from the recovery journal."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Divider()
+                    ForEach(profile.applications) { application in
+                        policyRow(
+                            name: application.name,
+                            detail: application.bundleIdentifier,
+                            icon: "app"
+                        )
+                    }
+                    ForEach(profile.services) { service in
+                        policyRow(name: service.name, detail: service.label, icon: "rectangle.stack.badge.minus")
+                    }
+                    ForEach(profile.processes) { process in
+                        policyRow(name: process.name, detail: process.executableName, icon: "terminal")
+                    }
+                    ForEach(profile.preferences) { preference in
+                        policyRow(
+                            name: preference.key,
+                            detail: preference.domain,
+                            icon: "slider.horizontal.3"
+                        )
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            GroupBox("Observed only · operator-controlled") {
+                VStack(alignment: .leading, spacing: 10) {
+                    policyRow(
+                        name: "Network infrastructure",
+                        detail:
+                            "VPNs, Tailscale, Little Snitch, firewalls, routes, DNS, interfaces, and network extensions",
+                        icon: "network"
+                    )
+                    policyRow(
+                        name: "System workloads",
+                        detail: "Time Machine, VMs, containers, and macOS services",
+                        icon: "externaldrive"
+                    )
+                    policyRow(
+                        name: "Low-level input drivers",
+                        detail: "Karabiner DriverKit and VirtualHID services",
+                        icon: "keyboard"
+                    )
+                }
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    private func policyRow(name: String, detail: String, icon: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name).font(.callout.weight(.medium))
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var agentHealthColor: Color {
+        switch model.agentHealth {
+        case .healthy: .green
+        case .connecting, .delayed: .orange
+        case .stale, .unavailable: .red
+        }
+    }
+
+    private var readinessColor: Color {
+        switch model.preflight?.highestSeverity {
+        case .critical: .red
+        case .warning: .orange
+        case .information: .green
+        case nil: .secondary
+        }
+    }
+
+    private func eventIcon(_ phase: CleanroomPhase) -> String {
+        switch phase {
+        case .active: "scope"
+        case .degraded: "exclamationmark.triangle.fill"
+        case .paused: "pause.circle.fill"
+        case .entering, .restoring: "arrow.triangle.2.circlepath"
+        case .idle: "checkmark.circle"
+        }
+    }
+
+    private func eventColor(_ phase: CleanroomPhase) -> Color {
+        switch phase {
+        case .active: .green
+        case .degraded: .red
+        case .paused: .orange
+        case .entering, .restoring: .blue
+        case .idle: .secondary
+        }
+    }
+
     private var phaseColor: Color {
         switch model.status?.phase {
         case .active: .green
@@ -247,5 +494,80 @@ private struct DashboardView: View {
         case .warning: .orange
         case .critical: .red
         }
+    }
+}
+
+private enum DashboardSection: String, CaseIterable, Identifiable {
+    case overview
+    case preflight
+    case activity
+    case policy
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .overview: "Overview"
+        case .preflight: "Preflight"
+        case .activity: "Activity"
+        case .policy: "Policy"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .overview: "scope"
+        case .preflight: "checklist"
+        case .activity: "clock.arrow.circlepath"
+        case .policy: "shield.lefthalf.filled"
+        }
+    }
+}
+
+private struct CleanroomSettingsView: View {
+    @ObservedObject var model: CleanroomViewModel
+
+    var body: some View {
+        Form {
+            Section("Startup") {
+                Toggle(
+                    "Launch the Cleanroom menu app at login",
+                    isOn: Binding(
+                        get: { model.launchAtLoginEnabled },
+                        set: { model.setLaunchAtLoginEnabled($0) }
+                    )
+                )
+                Text(model.launchAtLoginMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("The recovery agent remains registered independently of this menu-bar preference.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Notifications") {
+                Toggle(
+                    "Notify for degraded state and completed recovery",
+                    isOn: Binding(
+                        get: { model.notificationsEnabled },
+                        set: { model.setNotificationsEnabled($0) }
+                    )
+                )
+                Text(model.notificationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Cleanroom never posts a competitive-mode activation banner during gameplay.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Build") {
+                LabeledContent("Version", value: model.appVersion)
+                LabeledContent("Profile", value: "Roblox / Phantom Forces")
+                LabeledContent("Network control", value: "Read-only observations")
+            }
+        }
+        .formStyle(.grouped)
+        .padding(20)
     }
 }

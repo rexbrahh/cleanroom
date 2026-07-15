@@ -51,7 +51,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "CleanroomApp",
-            dependencies: ["CleanroomCore", "CleanroomMac", "CleanroomProtocol"]
+            dependencies: ["CleanroomCore", "CleanroomMac", "CleanroomProtocol"],
+            linkerSettings: [
+                .linkedFramework("UserNotifications")
+            ]
         ),
         .testTarget(
             name: "CleanroomCoreTests",

@@ -9,7 +9,7 @@ The first release is intentionally focused on one Mac and one game profile.
 The background agent owns all state transitions; the menu-bar app and
 `cleanroomctl` are clients.
 
-## V1 scope
+## Current scope
 
 - Native Swift menu-bar application
 - User LaunchAgent registered through Service Management
@@ -18,6 +18,12 @@ The background agent owns all state transitions; the menu-bar app and
 - Pointer acceleration and built-in-trackpad control
 - Competitive preflight and degraded-state recovery
 - CLI and structured diagnostics
+- Persistent pause intent across agent restarts
+- Live health, session, readiness, and activity views
+- Durable versioned GitHub release artifacts
+- Multi-section overview, preflight, activity, and fixed-policy dashboard
+- Opt-in recovery notifications and menu-app launch-at-login control
+- Clipboard and file diagnostics export
 
 See [Architecture](docs/architecture.md) for process and safety boundaries.
 
@@ -65,3 +71,19 @@ To reproduce the artifact locally:
 ./scripts/build-app.sh
 ./scripts/package-app.sh
 ```
+
+Semantic tags such as `v2.0.0` additionally create a durable private GitHub
+release containing the verified app ZIP and SHA-256 checksum. Build metadata is
+injected with `CLEANROOM_VERSION` and `CLEANROOM_BUILD_NUMBER`, keeping the app
+bundle version aligned with the tag.
+
+## Network boundary
+
+Network infrastructure remains operator-controlled. Cleanroom can report VPN,
+route, filter, and interface conditions during preflight, but it never stops or
+reconfigures VPNs, Tailscale, Little Snitch, firewalls, network extensions,
+routes, DNS, or network interfaces.
+
+The Policy screen lists the complete mutation set and separately identifies
+operator-controlled software. This makes the boundary visible in the app in
+addition to enforcing it in tests.

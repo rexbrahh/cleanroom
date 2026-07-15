@@ -1,0 +1,54 @@
+name: macOS Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Cleanroom.app
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7.0.0
+
+      - name: Validate release tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a semantic version tag such as v3.0.0" >&2
+            exit 1
+          fi
+
+      - name: Lint Swift formatting
+        run: swift format lint --recursive --parallel Sources Tests Package.swift
+
+      - name: Run tests
+        run: swift test
+
+      - name: Assemble versioned app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CLEANROOM_VERSION="$VERSION" \
+            CLEANROOM_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
+            ./scripts/build-app.sh
+
+      - name: Package verified app
+        run: ./scripts/package-app.sh
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/Cleanroom.zip \
+            dist/Cleanroom.zip.sha256 \
+            --verify-tag \
+            --generate-notes \
+            --title "Cleanroom $GITHUB_REF_NAME"

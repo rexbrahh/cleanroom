@@ -51,3 +51,17 @@ Cleanroom never clears `recovery.json` after a partial or unknown restoration.
 Use the dashboard's recovery panel or `cleanroomctl recover retry-restore`.
 Journal discard requires an explicit confirmation because it gives up the
 remaining automatic restore path.
+
+## Continuous integration
+
+GitHub Actions runs Swift formatting checks, the complete test suite, release
+assembly, nested code-signature verification, and ZIP validation on pushes to
+`main`, pull requests, and manual dispatches. Successful runs upload
+`Cleanroom.zip` and its SHA-256 checksum as a 14-day workflow artifact.
+
+To reproduce the artifact locally:
+
+```sh
+./scripts/build-app.sh
+./scripts/package-app.sh
+```

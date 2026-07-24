@@ -14,6 +14,9 @@ The background agent owns all state transitions; the menu-bar app and
 - Native Swift menu-bar application
 - User LaunchAgent registered through Service Management
 - Recovery-safe enter, re-enforce, and restore state machine
+- Automatic rollback when entry verification fails
+- Scoped automatic-retry suppression that never blocks restore-on-quit
+- Stable-exit debounce before automatic restoration
 - Preconfigured Roblox/Phantom Forces helper policy
 - Pointer acceleration and built-in-trackpad control
 - Competitive preflight and degraded-state recovery
@@ -52,6 +55,11 @@ cleanroomctl events --limit 20
 The LaunchAgent continues watching when the menu-bar UI is closed. Use Pause
 in the menu or `cleanroomctl pause` to suppress new cleanroom entry; restoration
 of an already-saved session remains armed.
+
+When Roblox exits, the agent restores the saved state automatically once the
+exit has been stable for five seconds (Roblox sometimes relaunches itself for
+updates). If entry ever fails partway, Cleanroom rolls back to the saved
+snapshot on its own instead of leaving helpers stopped.
 
 Cleanroom never clears `recovery.json` after a partial or unknown restoration.
 Use the dashboard's recovery panel or `cleanroomctl recover retry-restore`.

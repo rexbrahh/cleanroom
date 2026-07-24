@@ -11,10 +11,13 @@ behind protocols in `CleanroomMac`.
 
 The app registers the agent with `SMAppService`. It fingerprints the embedded
 helper and refreshes registration when an installed helper changes, as required
-by Service Management for updated LaunchAgent executables. The CLI and app use
-one per-user Mach service; neither process mutates cleanroom state directly.
-The menu app can register itself as a login item independently; that setting
-does not change the recovery agent's registration or state.
+by Service Management for updated LaunchAgent executables. When the agent stops
+answering, the app first kickstarts its launchd job and falls back to a forced
+re-registration if the job is gone; all XPC calls are time-bounded so a dead
+agent cannot wedge clients. The CLI and app use one per-user Mach service;
+neither process mutates cleanroom state directly. The menu app can register
+itself as a login item independently; that setting does not change the
+recovery agent's registration or state.
 
 ## Safety invariants
 
@@ -34,8 +37,21 @@ network component may appear in the fixed profile's mutation set.
 
 `idle -> entering -> active -> restoring -> idle`
 
-Any failed or unknown postcondition enters `degraded`. Recovery can retry entry,
-retry restoration, or explicitly discard the journal after user confirmation.
+Any failed or unknown postcondition enters `degraded`. A failed entry rolls the
+saved snapshot back automatically; the journal is cleared when the rollback
+verifies and is retained only when the rollback itself is incomplete.
+
+Automatic retry suppression is scoped to the transition kind that failed: a
+failed entry or drift repair blocks only automatic re-entry, a failed restore
+blocks only automatic restore retries, and a failed rollback blocks both.
+Restoration of a saved session therefore stays armed after an entry failure,
+and restore loops are still impossible. Recovery can retry entry, retry
+restoration, or explicitly discard the journal after user confirmation.
+
+Automatic restoration fires only after the Roblox exit probe has been stable
+for five seconds, so a Roblox auto-update relaunch or a quick crash-and-
+relaunch does not thrash between restore and re-entry. Manual restore commands
+are never debounced.
 
 ## Gameplay policy
 

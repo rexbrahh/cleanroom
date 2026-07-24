@@ -97,10 +97,13 @@ private struct CleanroomMenu: View {
             Divider()
             Button("Competitive Preflight") { model.runPreflight() }
                 .disabled(model.operationInProgress)
+                .keyboardShortcut("p")
             Button("Enter / Re-enforce") { model.enter() }
                 .disabled(model.operationInProgress)
+                .keyboardShortcut("e")
             Button("Restore Saved State") { model.restore() }
                 .disabled(model.operationInProgress || model.status?.journal == nil)
+                .keyboardShortcut("r")
             Button(model.status?.phase == .paused ? "Resume Automatic Control" : "Pause Automatic Control") {
                 model.togglePause()
             }
@@ -110,13 +113,17 @@ private struct CleanroomMenu: View {
                 openWindow(id: "dashboard")
                 NSApplication.shared.activate(ignoringOtherApps: true)
             }
+            .keyboardShortcut("o")
             SettingsLink {
                 Text("Settings…")
             }
             Divider()
             Button("Quit Menu Bar App") { NSApplication.shared.terminate(nil) }
         }
-        .onAppear { model.start() }
+        .onAppear {
+            model.start()
+            model.menuOpened()
+        }
     }
 }
 

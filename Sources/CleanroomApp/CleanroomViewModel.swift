@@ -161,6 +161,14 @@ final class CleanroomViewModel: ObservableObject {
             case .enabled:
                 if digest == nil || registeredDigest != digest || forceReregister {
                     registrationMessage = "Refreshing background-agent registration…"
+                    // Boot the old job out first: a job bound to a replaced
+                    // bundle can survive unregister/register and keep
+                    // crash-looping on its unresolvable program path.
+                    _ = await LocalCommandRunner().run(
+                        "/bin/launchctl",
+                        arguments: ["bootout", "gui/\(getuid())/com.rex.cleanroom.agent"],
+                        timeout: 5
+                    )
                     try await service.unregister()
                     try await Task.sleep(for: .seconds(1))
                     try service.register()
@@ -219,9 +227,19 @@ final class CleanroomViewModel: ObservableObject {
         do {
             let response = try await client.send(.status)
             guard case .status(let status) = response.payload else { return }
-            self.status = status
-            self.preflight = status.preflight ?? preflight
-            connectionMessage = status.lastMessage
+            // Publish only on change: assigning @Published values fires
+            // objectWillChange even when the value is identical, which would
+            // re-render the menu and dashboard on every 2s poll.
+            if self.status != status {
+                self.status = status
+            }
+            let resolvedPreflight = status.preflight ?? preflight
+            if self.preflight != resolvedPreflight {
+                self.preflight = resolvedPreflight
+            }
+            if connectionMessage != status.lastMessage {
+                connectionMessage = status.lastMessage
+            }
             handlePhaseTransition(to: status.phase)
             statusPollCount += 1
             if statusPollCount == 1 || statusPollCount.isMultiple(of: 5) {
@@ -242,30 +260,57 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     /// The BTM registration can report "enabled" while launchd has no live
-    /// job for the agent (e.g. the app bundle was replaced underneath the
-    /// registration, leaving a crash-looping or unloaded job). A plain
-    /// kickstart reloads a dead job; if launchd has no job at all, force a
-    /// fresh SMAppService registration even when the binary digest is
-    /// unchanged.
+    /// job for the agent, or a wedged job that crash-loops because its
+    /// relative BundleProgram no longer resolves after the app bundle was
+    /// replaced. Repair in stages: kickstart revives an unloaded job and is
+    /// harmless to a healthy agent; a status probe then distinguishes a busy
+    /// agent from a dead one; only a wedged job is booted out and forcibly
+    /// re-registered.
     private func repairAgentLiveness() async {
-        let kickstart = await LocalCommandRunner().run(
+        _ = await LocalCommandRunner().run(
             "/bin/launchctl",
             arguments: ["kickstart", "gui/\(getuid())/com.rex.cleanroom.agent"],
             timeout: 5
         )
-        if kickstart.succeeded {
-            logger.notice("Agent job kickstarted after a connection failure")
+        if await probeAgent() {
+            logger.notice("Agent answered after kickstart; no re-registration needed")
             return
         }
-        logger.notice("Agent kickstart failed; forcing registration refresh")
+        logger.notice("Agent still unreachable after kickstart; booting out and re-registering")
+        _ = await LocalCommandRunner().run(
+            "/bin/launchctl",
+            arguments: ["bootout", "gui/\(getuid())/com.rex.cleanroom.agent"],
+            timeout: 5
+        )
         await refreshAgentRegistration(force: true, forceReregister: true)
+    }
+
+    private func probeAgent() async -> Bool {
+        do {
+            let response = try await client.send(.status)
+            if case .status = response.payload { return true }
+        } catch {
+            await client.invalidate()
+        }
+        return false
+    }
+
+    /// The polling cadence means the menu can show slightly stale state when
+    /// it opens; refresh immediately so what the user sees is never behind.
+    func menuOpened() {
+        Task { [weak self] in
+            await self?.refreshStatus()
+        }
     }
 
     func refreshEvents() async {
         do {
             let response = try await client.send(.recentEvents(limit: 30))
             guard case .events(let events) = response.payload else { return }
-            recentEvents = events.reversed()
+            let ordered = events.reversed() as [TransitionReport]
+            if recentEvents != ordered {
+                recentEvents = ordered
+            }
         } catch {
             await client.invalidate()
         }

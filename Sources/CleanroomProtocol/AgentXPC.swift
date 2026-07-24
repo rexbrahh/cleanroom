@@ -87,6 +87,7 @@ public actor CleanroomAgentClient {
 private final class ContinuationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Data, Error>?
+    private var timeoutTask: Task<Void, Never>?
 
     init(_ continuation: CheckedContinuation<Data, Error>) {
         self.continuation = continuation
@@ -101,15 +102,20 @@ private final class ContinuationGate: @unchecked Sendable {
     }
 
     func armTimeout(after seconds: TimeInterval) {
-        Task { [self] in
+        let task = Task { [self] in
             try? await Task.sleep(for: .seconds(seconds))
             fail(AgentProtocolError.timedOut)
         }
+        lock.lock()
+        timeoutTask = task
+        lock.unlock()
     }
 
     private func take() -> CheckedContinuation<Data, Error>? {
         lock.lock()
         defer { lock.unlock() }
+        timeoutTask?.cancel()
+        timeoutTask = nil
         let value = continuation
         continuation = nil
         return value

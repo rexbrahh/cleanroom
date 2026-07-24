@@ -74,35 +74,32 @@ public struct LocalCommandRunner: CommandRunning, Sendable {
             process.standardOutput = standardOutput
             process.standardError = standardError
 
-            do {
-                try process.run()
-            } catch {
+            // Completion is delivered through terminationHandler instead of a
+            // 20ms isRunning poll, so fast commands return in milliseconds
+            // rather than paying a polling-floor latency on every invocation.
+            let completion = await withCheckedContinuation { continuation in
+                let gate = ProcessCompletionGate(continuation)
+                process.terminationHandler = { _ in gate.finish(timedOut: false) }
+                do {
+                    try process.run()
+                } catch {
+                    process.terminationHandler = nil
+                    gate.finish(timedOut: false, launchError: error.localizedDescription)
+                    return
+                }
+                gate.armTimeout(after: max(timeout, 0.1), process: process)
+            }
+            if let launchError = completion.launchError {
                 return CommandResult(
                     executable: executable,
                     arguments: arguments,
                     exitCode: -1,
-                    launchError: error.localizedDescription
+                    launchError: launchError
                 )
             }
 
-            let deadline = Date().addingTimeInterval(max(timeout, 0.1))
-            var timedOut = false
-            while process.isRunning {
-                if Date() >= deadline {
-                    timedOut = true
-                    process.terminate()
-                    Darwin.usleep(200_000)
-                    if process.isRunning {
-                        Darwin.kill(process.processIdentifier, SIGKILL)
-                    }
-                    break
-                }
-                Darwin.usleep(20_000)
-            }
-            process.waitUntilExit()
             try? standardOutput.synchronize()
             try? standardError.synchronize()
-
             let outputData = (try? Data(contentsOf: standardOutputURL)) ?? Data()
             let errorData = (try? Data(contentsOf: standardErrorURL)) ?? Data()
             return CommandResult(
@@ -111,7 +108,7 @@ public struct LocalCommandRunner: CommandRunning, Sendable {
                 exitCode: process.terminationStatus,
                 standardOutput: String(decoding: outputData, as: UTF8.self),
                 standardError: String(decoding: errorData, as: UTF8.self),
-                timedOut: timedOut
+                timedOut: completion.timedOut
             )
         }.value
     }
@@ -141,5 +138,55 @@ public struct LocalCommandRunner: CommandRunning, Sendable {
                 )
             }
         }.value
+    }
+}
+
+private struct ProcessCompletion {
+    let timedOut: Bool
+    let launchError: String?
+}
+
+/// Resumes the command continuation exactly once, whether the process exits
+/// on its own, fails to launch, or is killed by the timeout watchdog.
+private final class ProcessCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<ProcessCompletion, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var process: Process?
+
+    init(_ continuation: CheckedContinuation<ProcessCompletion, Never>) {
+        self.continuation = continuation
+    }
+
+    func finish(timedOut: Bool, launchError: String? = nil) {
+        lock.lock()
+        let taken = continuation
+        continuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        lock.unlock()
+        taken?.resume(returning: ProcessCompletion(timedOut: timedOut, launchError: launchError))
+    }
+
+    func armTimeout(after seconds: TimeInterval, process: Process) {
+        lock.lock()
+        self.process = process
+        lock.unlock()
+        let task = Task { [self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            if let process = self.process, process.isRunning {
+                process.terminate()
+                Darwin.usleep(200_000)
+                if process.isRunning {
+                    Darwin.kill(process.processIdentifier, SIGKILL)
+                }
+            }
+            self.process?.waitUntilExit()
+            finish(timedOut: true)
+        }
+        lock.lock()
+        timeoutTask = task
+        lock.unlock()
     }
 }

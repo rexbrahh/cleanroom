@@ -70,10 +70,32 @@ public actor DiagnosticsStore {
         try truncateIfNeeded()
     }
 
+    /// Reads only the tail of the log. The full file is capped at 512 KiB,
+    /// but transition events with complete results can be tens of KB each, so
+    /// a generous window keeps every caller's limit satisfiable while avoiding
+    /// a whole-file read and split on every poll.
     public func recentEvents(limit: Int = 50) -> [TransitionReport] {
-        guard let data = try? Data(contentsOf: eventLogURL),
-            let text = String(data: data, encoding: .utf8)
+        guard let handle = try? FileHandle(forReadingFrom: eventLogURL) else { return [] }
+        defer { try? handle.close() }
+        guard
+            let size = try? handle.seekToEnd(),
+            size > 0
         else { return [] }
+
+        let window: UInt64 = 256 * 1024
+        let offset = size > window ? size - window : 0
+        var data: Data
+        do {
+            try handle.seek(toOffset: offset)
+            data = try handle.readToEnd() ?? Data()
+        } catch {
+            return []
+        }
+        if offset > 0, let firstNewline = data.firstIndex(of: 0x0A) {
+            data = data[data.index(after: firstNewline)...]
+        }
+
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return text.split(separator: "\n")

@@ -8,6 +8,16 @@ public actor FileRecoveryJournalStore: RecoveryJournalPersisting {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
+    /// The status path loads the journal on every UI poll. The agent is the
+    /// only writer, so a signature check (mtime + size, one stat call) lets
+    /// repeated loads skip the read and decode entirely.
+    private var cache: (signature: FileSignature?, journal: RecoveryJournal?)?
+
+    private struct FileSignature: Equatable {
+        let modifiedAt: Date
+        let size: Int
+    }
+
     public init(
         directoryURL: URL = CleanroomPaths.applicationSupportDirectory,
         fileManager: FileManager = .default
@@ -31,6 +41,16 @@ public actor FileRecoveryJournalStore: RecoveryJournalPersisting {
     }
 
     public func loadJournal() throws -> RecoveryJournal? {
+        let signature = currentSignature()
+        if let cache, cache.signature == signature {
+            return cache.journal
+        }
+        let journal = try loadJournalFromDisk()
+        cache = (signature, journal)
+        return journal
+    }
+
+    private func loadJournalFromDisk() throws -> RecoveryJournal? {
         guard journalExists() else { return nil }
         do {
             let data = try Data(contentsOf: journalURL)
@@ -54,6 +74,7 @@ public actor FileRecoveryJournalStore: RecoveryJournalPersisting {
                 [.posixPermissions: 0o600],
                 ofItemAtPath: journalURL.path
             )
+            cache = (currentSignature(), journal)
         } catch let error as CleanroomError {
             throw error
         } catch {
@@ -62,12 +83,25 @@ public actor FileRecoveryJournalStore: RecoveryJournalPersisting {
     }
 
     public func clearJournal() throws {
-        guard journalExists() else { return }
+        guard journalExists() else {
+            cache = (nil, nil)
+            return
+        }
         do {
             try fileManager.removeItem(at: journalURL)
+            cache = (nil, nil)
         } catch {
             throw CleanroomError.persistenceFailed(error.localizedDescription)
         }
+    }
+
+    private func currentSignature() -> FileSignature? {
+        guard
+            let attributes = try? fileManager.attributesOfItem(atPath: journalURL.path),
+            let modifiedAt = attributes[.modificationDate] as? Date,
+            let size = attributes[.size] as? NSNumber
+        else { return nil }
+        return FileSignature(modifiedAt: modifiedAt, size: size.intValue)
     }
 
     private func ensureDirectory() throws {

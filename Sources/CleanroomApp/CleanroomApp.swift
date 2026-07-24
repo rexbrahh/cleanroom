@@ -1,12 +1,17 @@
 import AppKit
 import CleanroomCore
+import OSLog
 import SwiftUI
 
 @main
 struct CleanroomApp: App {
+    @NSApplicationDelegateAdaptor(CleanroomAppDelegate.self) private var delegate
     @StateObject private var model: CleanroomViewModel
+    private static let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
 
     init() {
+        Self.sanitizeStatusItemPosition()
+        Self.logger.notice("Cleanroom menu app launched")
         let model = CleanroomViewModel()
         _model = StateObject(wrappedValue: model)
         model.start()
@@ -16,7 +21,10 @@ struct CleanroomApp: App {
         MenuBarExtra {
             CleanroomMenu(model: model)
         } label: {
+            // Icon-only: long phase text in the menu bar gets the item hidden
+            // outright on notch-limited displays.
             Label(model.phaseTitle, systemImage: model.iconName)
+                .labelStyle(.iconOnly)
         }
         .menuBarExtraStyle(.menu)
 
@@ -30,6 +38,49 @@ struct CleanroomApp: App {
         Settings {
             CleanroomSettingsView(model: model)
                 .frame(width: 520)
+        }
+    }
+
+    /// Removes a persisted status-item position that is stranded off every
+    /// connected screen (e.g. saved while an external display was attached).
+    /// macOS autosaves the position but does not always clamp it back on
+    /// screen, which leaves the menu-bar item invisible.
+    private static func sanitizeStatusItemPosition() {
+        let key = "NSStatusItem Preferred Position Item-0"
+        let defaults = UserDefaults.standard
+        guard let saved = defaults.object(forKey: key) as? NSNumber else { return }
+        let position = CGFloat(saved.doubleValue)
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+        let onScreen = screens.contains { screen in
+            position >= screen.frame.minX && position <= screen.frame.maxX
+        }
+        if !onScreen {
+            defaults.removeObject(forKey: key)
+            logger.notice(
+                "Removed off-screen status-item position \(saved.doubleValue, privacy: .public)"
+            )
+        }
+    }
+}
+
+/// Logs a one-time window inventory a few seconds after launch so menu-bar
+/// visibility problems are diagnosable from the unified log instead of being
+/// indistinguishable from a silent no-op.
+final class CleanroomAppDelegate: NSObject, NSApplicationDelegate {
+    private let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [logger] in
+            let inventory = NSApp.windows
+                .map { "\(type(of: $0)) \(NSRectToCGRect($0.frame))" }
+                .joined(separator: "; ")
+            let hasStatusItem = NSApp.windows.contains {
+                String(describing: type(of: $0)) == "NSStatusBarWindow"
+            }
+            logger.notice(
+                "Window inventory (status item: \(hasStatusItem, privacy: .public)): \(inventory, privacy: .public)"
+            )
         }
     }
 }

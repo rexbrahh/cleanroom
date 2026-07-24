@@ -1,9 +1,11 @@
 import AppKit
 import CleanroomCore
+import CleanroomMac
 import CleanroomProtocol
 import Combine
 import CryptoKit
 import Foundation
+import OSLog
 import ServiceManagement
 import UniformTypeIdentifiers
 @preconcurrency import UserNotifications
@@ -19,10 +21,11 @@ final class CleanroomViewModel: ObservableObject {
     @Published var recentEvents: [TransitionReport] = []
     @Published var notificationsEnabled: Bool
     @Published var notificationMessage = "Gameplay notifications are off"
-    @Published var launchAtLoginEnabled: Bool
-    @Published var launchAtLoginMessage = "Menu-bar launch at login is off"
+    @Published var launchAtLoginEnabled = false
+    @Published var launchAtLoginMessage = "Checking menu-app launch at login…"
 
     private let client = CleanroomAgentClient()
+    private let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
     private var pollingTask: Task<Void, Never>?
     private var started = false
     private var registrationInProgress = false
@@ -33,13 +36,11 @@ final class CleanroomViewModel: ObservableObject {
     private static let notificationsPreferenceKey = "recoveryNotificationsEnabled"
 
     init() {
+        // Keep ServiceManagement and UserNotifications IPC out of the app's
+        // initialization path; both are refreshed asynchronously in start().
         notificationsEnabled = UserDefaults.standard.bool(
             forKey: Self.notificationsPreferenceKey
         )
-        launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
-        if launchAtLoginEnabled {
-            launchAtLoginMessage = "Menu-bar app launches at login"
-        }
     }
 
     enum AgentHealth {
@@ -126,9 +127,11 @@ final class CleanroomViewModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        logger.notice("View model started; refreshing registration state")
         Task { [weak self] in
             await self?.refreshAgentRegistration()
             await self?.refreshNotificationAuthorization()
+            await self?.refreshLaunchAtLoginStatus()
         }
         pollingTask = Task { [weak self] in
             guard let self else { return }
@@ -145,7 +148,7 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
-    private func refreshAgentRegistration(force: Bool = false) async {
+    private func refreshAgentRegistration(force: Bool = false, forceReregister: Bool = false) async {
         guard !registrationInProgress else { return }
         registrationInProgress = true
         defer { registrationInProgress = false }
@@ -156,7 +159,7 @@ final class CleanroomViewModel: ObservableObject {
         do {
             switch service.status {
             case .enabled:
-                if digest == nil || registeredDigest != digest {
+                if digest == nil || registeredDigest != digest || forceReregister {
                     registrationMessage = "Refreshing background-agent registration…"
                     try await service.unregister()
                     try await Task.sleep(for: .seconds(1))
@@ -183,6 +186,7 @@ final class CleanroomViewModel: ObservableObject {
             }
         } catch {
             registrationMessage = "Agent registration failed: \(error.localizedDescription)"
+            logger.error("Agent registration failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -224,13 +228,37 @@ final class CleanroomViewModel: ObservableObject {
                 await refreshEvents()
             }
         } catch {
-            connectionMessage = "Agent unavailable: \(error.localizedDescription)"
+            let message = "Agent unavailable: \(error.localizedDescription)"
+            if connectionMessage != message {
+                logger.error("\(message, privacy: .public)")
+            }
+            connectionMessage = message
             await client.invalidate()
             if Date().timeIntervalSince(lastRegistrationRepairAt) >= 30 {
                 lastRegistrationRepairAt = Date()
-                await refreshAgentRegistration(force: true)
+                await repairAgentLiveness()
             }
         }
+    }
+
+    /// The BTM registration can report "enabled" while launchd has no live
+    /// job for the agent (e.g. the app bundle was replaced underneath the
+    /// registration, leaving a crash-looping or unloaded job). A plain
+    /// kickstart reloads a dead job; if launchd has no job at all, force a
+    /// fresh SMAppService registration even when the binary digest is
+    /// unchanged.
+    private func repairAgentLiveness() async {
+        let kickstart = await LocalCommandRunner().run(
+            "/bin/launchctl",
+            arguments: ["kickstart", "gui/\(getuid())/com.rex.cleanroom.agent"],
+            timeout: 5
+        )
+        if kickstart.succeeded {
+            logger.notice("Agent job kickstarted after a connection failure")
+            return
+        }
+        logger.notice("Agent kickstart failed; forcing registration refresh")
+        await refreshAgentRegistration(force: true, forceReregister: true)
     }
 
     func refreshEvents() async {
@@ -303,23 +331,40 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
+    func refreshLaunchAtLoginStatus() {
+        let status = SMAppService.mainApp.status
+        launchAtLoginEnabled = status == .enabled
+        switch status {
+        case .enabled:
+            launchAtLoginMessage = "Menu-bar app launches at login"
+        case .requiresApproval:
+            launchAtLoginMessage = "Launch at login requires approval in Login Items"
+        case .notRegistered, .notFound:
+            launchAtLoginMessage = "Menu-bar launch at login is off"
+        @unknown default:
+            launchAtLoginMessage = "Menu-bar launch-at-login state is unknown"
+        }
+    }
+
     func setLaunchAtLoginEnabled(_ enabled: Bool) {
         Task { [weak self] in
             guard let self else { return }
             do {
                 if enabled {
+                    // Unregister first: a stale login-item registration can be
+                    // bound to an old app location (e.g. a dist/ build), which
+                    // silently keeps launch-at-login pointed at the wrong copy.
+                    try? await SMAppService.mainApp.unregister()
                     try SMAppService.mainApp.register()
+                    logger.notice("Menu-app login item registered from \(Bundle.main.bundleURL.path, privacy: .public)")
                 } else {
                     try await SMAppService.mainApp.unregister()
                 }
-                launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
-                launchAtLoginMessage =
-                    launchAtLoginEnabled
-                    ? "Menu-bar app launches at login"
-                    : "Menu-bar launch at login is off"
+                refreshLaunchAtLoginStatus()
             } catch {
-                launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+                refreshLaunchAtLoginStatus()
                 launchAtLoginMessage = "Login-item change failed: \(error.localizedDescription)"
+                logger.error("Login-item change failed: \(error.localizedDescription, privacy: .public)")
             }
         }
     }

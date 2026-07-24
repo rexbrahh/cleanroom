@@ -44,6 +44,7 @@ public struct AgentResponse: Codable, Sendable, Equatable {
 public enum AgentProtocolError: Error, LocalizedError, Sendable {
     case invalidResponse
     case requestMismatch
+    case timedOut
     case remoteFailure(String)
 
     public var errorDescription: String? {
@@ -52,6 +53,8 @@ public enum AgentProtocolError: Error, LocalizedError, Sendable {
             "The Cleanroom agent returned an invalid response."
         case .requestMismatch:
             "The Cleanroom agent response did not match the request."
+        case .timedOut:
+            "The Cleanroom agent did not respond in time."
         case .remoteFailure(let message):
             message
         }

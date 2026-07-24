@@ -16,29 +16,52 @@ public actor CleanroomAgentClient {
         let requestData = try AgentCodec.encode(request)
         let connection = activeConnection()
 
-        let responseData: Data = try await withCheckedThrowingContinuation { continuation in
-            let gate = ContinuationGate(continuation)
-            guard
-                let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
-                    gate.fail(error)
-                }) as? CleanroomAgentXPC
-            else {
-                gate.fail(AgentProtocolError.invalidResponse)
-                return
+        do {
+            let responseData: Data = try await withCheckedThrowingContinuation { continuation in
+                let gate = ContinuationGate(continuation)
+                gate.armTimeout(after: Self.timeout(for: command))
+                guard
+                    let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
+                        gate.fail(error)
+                    }) as? CleanroomAgentXPC
+                else {
+                    gate.fail(AgentProtocolError.invalidResponse)
+                    return
+                }
+                proxy.perform(requestData) { data in
+                    gate.succeed(data)
+                }
             }
-            proxy.perform(requestData) { data in
-                gate.succeed(data)
-            }
-        }
 
-        let response = try AgentCodec.decode(AgentResponse.self, from: responseData)
-        guard response.requestIdentifier == request.identifier else {
-            throw AgentProtocolError.requestMismatch
+            let response = try AgentCodec.decode(AgentResponse.self, from: responseData)
+            guard response.requestIdentifier == request.identifier else {
+                throw AgentProtocolError.requestMismatch
+            }
+            if case .failure(let message) = response.payload {
+                throw AgentProtocolError.remoteFailure(message)
+            }
+            return response
+        } catch {
+            // A wedged endpoint (e.g. launchd holds the Mach service while the
+            // agent cannot spawn) must not poison future sends: the next call
+            // gets a fresh connection.
+            if case AgentProtocolError.timedOut = error {
+                invalidate()
+            }
+            throw error
         }
-        if case .failure(let message) = response.payload {
-            throw AgentProtocolError.remoteFailure(message)
+    }
+
+    /// Bounded waits keep UI polling and the CLI responsive when the agent is
+    /// unreachable; transitions get generous budgets because they run
+    /// preflight, termination grace periods, and restore verification.
+    private static func timeout(for command: AgentCommand) -> TimeInterval {
+        switch command {
+        case .enter, .restore, .preflight, .recover, .migrateLegacy:
+            60
+        case .status, .reconcile, .setPaused, .recentEvents:
+            15
         }
-        return response
     }
 
     public func invalidate() {
@@ -75,6 +98,13 @@ private final class ContinuationGate: @unchecked Sendable {
 
     func fail(_ error: Error) {
         take()?.resume(throwing: error)
+    }
+
+    func armTimeout(after seconds: TimeInterval) {
+        Task { [self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            fail(AgentProtocolError.timedOut)
+        }
     }
 
     private func take() -> CheckedContinuation<Data, Error>? {

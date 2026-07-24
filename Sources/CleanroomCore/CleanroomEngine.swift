@@ -325,19 +325,21 @@ public actor CleanroomEngine {
             )
         }
 
-        latestPreflight = await system.preflight(profile: profile)
-        if !force,
-            profile.blockAutomaticEntryOnCriticalPreflight,
-            latestPreflight?.highestSeverity == .critical
-        {
-            phase = .degraded
-            lastMessage = "Competitive preflight contains a critical blocker."
-            lastResults = []
-            return TransitionReport(
-                phase: phase,
-                message: lastMessage,
-                preflight: latestPreflight
-            )
+        // Only profiles that gate entry on preflight pay its cost up front.
+        // For the fixed profile, preflight runs after the session is secured
+        // so the ~1.5s of inspection subprocesses never delays entry.
+        if profile.blockAutomaticEntryOnCriticalPreflight {
+            latestPreflight = await system.preflight(profile: profile)
+            if !force, latestPreflight?.highestSeverity == .critical {
+                phase = .degraded
+                lastMessage = "Competitive preflight contains a critical blocker."
+                lastResults = []
+                return TransitionReport(
+                    phase: phase,
+                    message: lastMessage,
+                    preflight: latestPreflight
+                )
+            }
         }
 
         if existingJournal == nil {
@@ -356,6 +358,10 @@ public actor CleanroomEngine {
         results.append(contentsOf: await system.verifyApplied(profile: profile))
         if results.contains(where: { $0.outcome.blocksCompletion }) {
             return await rollbackFailedEntry(results: results)
+        }
+
+        if !profile.blockAutomaticEntryOnCriticalPreflight {
+            latestPreflight = await system.preflight(profile: profile)
         }
 
         phase = .active

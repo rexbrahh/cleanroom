@@ -171,6 +171,24 @@ struct CleanroomEngineTests {
         #expect((await trace.events).contains("restore"))
     }
 
+    @Test("preflight does not delay entry for the non-gating profile")
+    func preflightRunsAfterApply() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace)
+        let system = FakeSystem(trace: trace)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store
+        )
+
+        let report = await engine.enter()
+
+        #expect(report.phase == .active)
+        let events = await trace.events
+        #expect(events.firstIndex(of: "apply")! < events.firstIndex(of: "preflight")!)
+    }
+
     @Test("failed entry rolls back to the snapshot and clears the journal")
     func failedEntryRollsBackCleanly() async throws {
         let trace = Trace()
@@ -426,8 +444,9 @@ private actor FakeSystem: CleanroomSystemControlling {
         ]
     }
 
-    func preflight(profile: CleanroomProfile) -> PreflightReport {
-        PreflightReport(findings: [])
+    func preflight(profile: CleanroomProfile) async -> PreflightReport {
+        await trace.append("preflight")
+        return PreflightReport(findings: [])
     }
 }
 

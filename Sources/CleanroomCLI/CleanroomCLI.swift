@@ -8,7 +8,7 @@ struct CleanroomCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "cleanroomctl",
         abstract: "Control the private Roblox/Phantom Forces Cleanroom agent.",
-        version: "3.0.1",
+        version: "3.1.0",
         subcommands: [
             Status.self,
             Enter.self,

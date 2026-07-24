@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="${0:A:h:h}"
 CONFIGURATION="${CONFIGURATION:-release}"
 SIGN_IDENTITY="${CLEANROOM_SIGN_IDENTITY:--}"
-VERSION="${CLEANROOM_VERSION:-3.0.1}"
-BUILD_NUMBER="${CLEANROOM_BUILD_NUMBER:-4}"
+VERSION="${CLEANROOM_VERSION:-3.1.0}"
+BUILD_NUMBER="${CLEANROOM_BUILD_NUMBER:-5}"
 APP="$ROOT/dist/Cleanroom.app"
 
 cd "$ROOT"
@@ -22,6 +22,7 @@ mkdir -p \
 /usr/bin/ditto "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"
+/usr/bin/ditto "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 /usr/bin/ditto "$ROOT/Resources/com.rex.cleanroom.agent.plist" \
   "$APP/Contents/Library/LaunchAgents/com.rex.cleanroom.agent.plist"
 /usr/bin/ditto "$BIN_PATH/Cleanroom" "$APP/Contents/MacOS/Cleanroom"

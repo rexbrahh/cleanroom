@@ -196,7 +196,13 @@ public actor MacSystemController: CleanroomSystemControlling {
             else { continue }
             results.append(await restorePreference(stored))
         }
-        results.append(contentsOf: await synchronizeProcesses(for: profile.preferences))
+        let syncResults = await synchronizeProcesses(for: profile.preferences)
+        results.append(contentsOf: syncResults)
+        if syncResults.contains(where: { $0.outcome == .succeeded }) {
+            // Give cfprefsd and the relaunched processes (e.g. Dock) a moment
+            // to settle before postconditions are read back.
+            try? await Task.sleep(for: .milliseconds(1500))
+        }
 
         let componentResults = await withTaskGroup(of: ActionResult.self) { group in
             for label in snapshot.activeServiceLabels {
@@ -231,14 +237,24 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
         results.append(contentsOf: componentResults.sorted(by: resultSort))
 
+        var verification: [(stored: StoredPreference, result: ActionResult)] = []
         for stored in snapshot.preferences {
             guard
                 profile.preferences.contains(where: {
                     $0.domain == stored.domain && $0.key == stored.key && $0.kind == stored.kind
                 })
             else { continue }
-            results.append(await verifyRestoredPreference(stored))
+            verification.append((stored, await verifyRestoredPreference(stored)))
         }
+        if verification.contains(where: { $0.result.outcome.blocksCompletion }) {
+            // Verification can race cfprefsd right after a synchronize; retry
+            // each failing readback once before declaring the restore failed.
+            try? await Task.sleep(for: .seconds(1))
+            for index in verification.indices where verification[index].result.outcome.blocksCompletion {
+                verification[index].result = await verifyRestoredPreference(verification[index].stored)
+            }
+        }
+        results.append(contentsOf: verification.map(\.result))
         return results
     }
 
@@ -406,8 +422,27 @@ public actor MacSystemController: CleanroomSystemControlling {
         ]
     }
 
+    /// Retries idempotent shell operations (defaults read/write/delete) that
+    /// fail transiently when cfprefsd is contended — e.g. exit 255 writes or
+    /// "domain not found" reads while the Dock is restarting.
+    private func runWithRetry(
+        _ executable: String,
+        arguments: [String],
+        timeout: TimeInterval,
+        attempts: Int = 3
+    ) async -> CommandResult {
+        var result = await commands.run(executable, arguments: arguments, timeout: timeout)
+        var remaining = attempts - 1
+        while !result.succeeded, remaining > 0 {
+            try? await Task.sleep(for: .milliseconds(300))
+            result = await commands.run(executable, arguments: arguments, timeout: timeout)
+            remaining -= 1
+        }
+        return result
+    }
+
     private func readPreference(_ preference: PreferenceAction) async throws -> StoredPreference {
-        let result = await commands.run(
+        let result = await runWithRetry(
             "/usr/bin/defaults",
             arguments: ["read", preference.domain, preference.key],
             timeout: 3
@@ -425,6 +460,7 @@ public actor MacSystemController: CleanroomSystemControlling {
         if !result.timedOut,
             result.launchError == nil,
             detail.contains("does not exist") || detail.contains("could not find")
+                || detail.contains("not found")
         {
             return StoredPreference(
                 domain: preference.domain,
@@ -440,7 +476,7 @@ public actor MacSystemController: CleanroomSystemControlling {
     }
 
     private func writePreference(_ preference: PreferenceAction) async -> ActionResult {
-        let result = await commands.run(
+        let result = await runWithRetry(
             "/usr/bin/defaults",
             arguments: [
                 "write", preference.domain, preference.key,
@@ -467,7 +503,7 @@ public actor MacSystemController: CleanroomSystemControlling {
         } else {
             arguments = ["delete", stored.domain, stored.key]
         }
-        let result = await commands.run("/usr/bin/defaults", arguments: arguments, timeout: 3)
+        let result = await runWithRetry("/usr/bin/defaults", arguments: arguments, timeout: 3)
         var deletionAlreadySatisfied = false
         if !stored.wasPresent, !result.succeeded {
             let action = PreferenceAction(
@@ -589,19 +625,38 @@ public actor MacSystemController: CleanroomSystemControlling {
                 action: "stop service", target: service.name, outcome: .unknown,
                 detail: "Service state could not be determined.")
         }
-        let result = await commands.run(
-            "/bin/launchctl",
-            arguments: ["bootout", "gui/\(userIdentifier)/\(service.label)"],
-            timeout: 5
-        )
-        let postcondition = await probeService(label: service.label)
-        let stopped = result.succeeded && postcondition == .stopped
+
+        // Success is defined by the postcondition, not by bootout's exit code:
+        // bootout exits non-zero when the service unloaded on its own between
+        // the probe and the command, which is still the desired end state.
+        var lastFailure = "Service did not unload."
+        for attempt in 1...3 {
+            let result = await commands.run(
+                "/bin/launchctl",
+                arguments: ["bootout", "gui/\(userIdentifier)/\(service.label)"],
+                timeout: 5
+            )
+            let postcondition = await probeService(label: service.label)
+            switch postcondition {
+            case .stopped:
+                let detail =
+                    attempt == 1
+                    ? "Unloaded for this session."
+                    : "Unloaded for this session after \(attempt) attempts."
+                return ActionResult(
+                    action: "stop service", target: service.name, outcome: .succeeded, detail: detail)
+            case .unknown:
+                return ActionResult(
+                    action: "stop service", target: service.name, outcome: .unknown,
+                    detail: "Service state could not be determined after bootout.")
+            case .running:
+                lastFailure = commandFailure(result)
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
         return ActionResult(
-            action: "stop service",
-            target: service.name,
-            outcome: stopped ? .succeeded : .failed,
-            detail: stopped ? "Unloaded for this session." : commandFailure(result)
-        )
+            action: "stop service", target: service.name, outcome: .failed,
+            detail: "Still loaded after 3 attempts. \(lastFailure)")
     }
 
     private func restoreService(_ service: ManagedService) async -> ActionResult {
@@ -656,45 +711,66 @@ public actor MacSystemController: CleanroomSystemControlling {
     }
 
     private func stopProcess(_ process: ManagedProcess) async -> ActionResult {
-        let state = await probeProcess(executableName: process.executableName)
-        if state == .stopped {
+        let initialState = await probeProcess(executableName: process.executableName)
+        if initialState == .stopped {
             return ActionResult(
                 action: "stop process", target: process.name, outcome: .skipped, detail: "Was already stopped.")
         }
-        if state == .unknown {
+        if initialState == .unknown {
             return ActionResult(
                 action: "stop process", target: process.name, outcome: .unknown,
                 detail: "Process state could not be determined.")
         }
-        let termination = await commands.run(
-            "/usr/bin/pkill",
-            arguments: ["-TERM", "-x", process.executableName],
-            timeout: 3
-        )
-        if termination.succeeded {
-            let deadline = Date().addingTimeInterval(1.5)
-            while Date() < deadline {
-                if await probeProcess(executableName: process.executableName) == .stopped {
-                    return ActionResult(
-                        action: "stop process", target: process.name, outcome: .succeeded,
-                        detail: "Terminated gracefully.")
-                }
-                try? await Task.sleep(for: .milliseconds(100))
+
+        // Success is defined by the postcondition probe, not by pkill's exit
+        // code: pkill exits 1 when the process exited on its own between the
+        // probe and the signal, which is still the desired end state.
+        var lastFailure = "Process did not exit."
+        for attempt in 1...3 {
+            _ = await commands.run(
+                "/usr/bin/pkill",
+                arguments: ["-TERM", "-x", process.executableName],
+                timeout: 3
+            )
+            if await waitUntilProcessStopped(process.executableName, timeout: 1.5) {
+                let detail =
+                    attempt == 1
+                    ? "Terminated gracefully."
+                    : "Terminated gracefully after \(attempt) attempts."
+                return ActionResult(
+                    action: "stop process", target: process.name, outcome: .succeeded, detail: detail)
             }
+
+            let forced = await commands.run(
+                "/usr/bin/pkill",
+                arguments: ["-KILL", "-x", process.executableName],
+                timeout: 3
+            )
+            if await waitUntilProcessStopped(process.executableName, timeout: 1) {
+                return ActionResult(
+                    action: "stop process", target: process.name, outcome: .succeeded,
+                    detail: "Force-terminated after grace period.")
+            }
+            lastFailure = commandFailure(forced)
+            if await probeProcess(executableName: process.executableName) == .unknown {
+                return ActionResult(
+                    action: "stop process", target: process.name, outcome: .unknown,
+                    detail: "Process state could not be determined after termination.")
+            }
+            try? await Task.sleep(for: .milliseconds(250))
         }
-        let forced = await commands.run(
-            "/usr/bin/pkill",
-            arguments: ["-KILL", "-x", process.executableName],
-            timeout: 3
-        )
-        let postcondition = await probeProcess(executableName: process.executableName)
-        let stopped = forced.succeeded && postcondition == .stopped
         return ActionResult(
-            action: "stop process",
-            target: process.name,
-            outcome: stopped ? .succeeded : .failed,
-            detail: stopped ? "Force-terminated after grace period." : commandFailure(forced)
-        )
+            action: "stop process", target: process.name, outcome: .failed,
+            detail: "Still running after 3 attempts. \(lastFailure)")
+    }
+
+    private func waitUntilProcessStopped(_ executableName: String, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await probeProcess(executableName: executableName) == .stopped { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return await probeProcess(executableName: executableName) == .stopped
     }
 
     private func restoreProcess(_ process: ManagedProcess) async -> ActionResult {

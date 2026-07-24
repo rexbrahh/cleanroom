@@ -6,15 +6,18 @@ public actor MacSystemController: CleanroomSystemControlling {
 
     private let commands: any CommandRunning
     private let applications: any ApplicationManaging
+    private let preferences: any PreferenceReading
     private let userIdentifier: uid_t
 
     public init(
         commands: any CommandRunning,
         applications: any ApplicationManaging,
+        preferences: any PreferenceReading = CFPreferenceReader(),
         userIdentifier: uid_t = getuid()
     ) {
         self.commands = commands
         self.applications = applications
+        self.preferences = preferences
         self.userIdentifier = userIdentifier
     }
 
@@ -107,10 +110,15 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
 
         var results: [ActionResult] = []
+        var changedSyncProcesses: [String] = []
         for preference in profile.preferences {
-            results.append(await writePreference(preference))
+            let outcome = await writePreferenceIfNeeded(preference)
+            results.append(outcome.result)
+            if outcome.changed, let synchronize = preference.synchronizeProcess {
+                changedSyncProcesses.append(synchronize)
+            }
         }
-        results.append(contentsOf: await synchronizeProcesses(for: profile.preferences))
+        results.append(contentsOf: await synchronizeProcesses(Set(changedSyncProcesses)))
 
         let componentResults = await withTaskGroup(of: ActionResult.self) { group in
             for service in profile.services {
@@ -188,15 +196,24 @@ public actor MacSystemController: CleanroomSystemControlling {
             return results
         }
 
+        var changedSyncProcesses: [String] = []
         for stored in snapshot.preferences {
             guard
                 profile.preferences.contains(where: {
                     $0.domain == stored.domain && $0.key == stored.key && $0.kind == stored.kind
                 })
             else { continue }
-            results.append(await restorePreference(stored))
+            let outcome = await restorePreferenceIfNeeded(stored)
+            results.append(outcome.result)
+            if outcome.changed,
+                let synchronize = profile.preferences.first(where: {
+                    $0.domain == stored.domain && $0.key == stored.key && $0.kind == stored.kind
+                })?.synchronizeProcess
+            {
+                changedSyncProcesses.append(synchronize)
+            }
         }
-        let syncResults = await synchronizeProcesses(for: profile.preferences)
+        let syncResults = await synchronizeProcesses(Set(changedSyncProcesses))
         results.append(contentsOf: syncResults)
         if syncResults.contains(where: { $0.outcome == .succeeded }) {
             // Give cfprefsd and the relaunched processes (e.g. Dock) a moment
@@ -442,40 +459,29 @@ public actor MacSystemController: CleanroomSystemControlling {
     }
 
     private func readPreference(_ preference: PreferenceAction) async throws -> StoredPreference {
-        let result = await runWithRetry(
-            "/usr/bin/defaults",
-            arguments: ["read", preference.domain, preference.key],
-            timeout: 3
-        )
-        if result.succeeded {
-            return StoredPreference(
-                domain: preference.domain,
-                key: preference.key,
-                kind: preference.kind,
-                wasPresent: true,
-                value: result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
-        }
-        let detail = "\(result.standardOutput)\n\(result.standardError)".lowercased()
-        if !result.timedOut,
-            result.launchError == nil,
-            detail.contains("does not exist") || detail.contains("could not find")
-                || detail.contains("not found")
-        {
-            return StoredPreference(
-                domain: preference.domain,
-                key: preference.key,
-                kind: preference.kind,
-                wasPresent: false,
-                value: nil
-            )
-        }
-        throw CleanroomError.mutationFailed(
-            "Could not read \(preference.domain):\(preference.key): \(commandFailure(result))"
-        )
+        try await preferences.readStored(preference)
     }
 
-    private func writePreference(_ preference: PreferenceAction) async -> ActionResult {
+    /// Writes the target value only when the current value differs, so a
+    /// no-op apply never disturbs cfprefsd or triggers a synchronize.
+    private func writePreferenceIfNeeded(_ preference: PreferenceAction) async
+        -> (result: ActionResult, changed: Bool)
+    {
+        let target = "\(preference.domain):\(preference.key)"
+        if let current = try? await readPreference(preference),
+            current.wasPresent,
+            valuesMatch(current.value, preference.activeValue, kind: preference.kind)
+        {
+            return (
+                ActionResult(
+                    action: "apply preference",
+                    target: target,
+                    outcome: .skipped,
+                    detail: "Already at the target value."
+                ),
+                false
+            )
+        }
         let result = await runWithRetry(
             "/usr/bin/defaults",
             arguments: [
@@ -484,16 +490,43 @@ public actor MacSystemController: CleanroomSystemControlling {
             ],
             timeout: 3
         )
-        return ActionResult(
-            action: "apply preference",
-            target: "\(preference.domain):\(preference.key)",
-            outcome: result.succeeded ? .succeeded : .failed,
-            detail: result.succeeded ? "Set to \(preference.activeValue)." : commandFailure(result)
+        return (
+            ActionResult(
+                action: "apply preference",
+                target: target,
+                outcome: result.succeeded ? .succeeded : .failed,
+                detail: result.succeeded ? "Set to \(preference.activeValue)." : commandFailure(result)
+            ),
+            true
         )
     }
 
-    private func restorePreference(_ stored: StoredPreference) async -> ActionResult {
+    /// Restores the saved value only when the current value differs from it.
+    private func restorePreferenceIfNeeded(_ stored: StoredPreference) async
+        -> (result: ActionResult, changed: Bool)
+    {
         let target = "\(stored.domain):\(stored.key)"
+        let probe = PreferenceAction(
+            domain: stored.domain,
+            key: stored.key,
+            kind: stored.kind,
+            activeValue: stored.value ?? ""
+        )
+        if let current = try? await readPreference(probe),
+            current.wasPresent == stored.wasPresent,
+            !stored.wasPresent || valuesMatch(current.value, stored.value, kind: stored.kind)
+        {
+            return (
+                ActionResult(
+                    action: "restore preference",
+                    target: target,
+                    outcome: .skipped,
+                    detail: "Already matches the saved state."
+                ),
+                false
+            )
+        }
+
         let arguments: [String]
         if stored.wasPresent, let value = stored.value {
             arguments = [
@@ -506,23 +539,20 @@ public actor MacSystemController: CleanroomSystemControlling {
         let result = await runWithRetry("/usr/bin/defaults", arguments: arguments, timeout: 3)
         var deletionAlreadySatisfied = false
         if !stored.wasPresent, !result.succeeded {
-            let action = PreferenceAction(
-                domain: stored.domain,
-                key: stored.key,
-                kind: stored.kind,
-                activeValue: ""
-            )
-            if let actual = try? await readPreference(action) {
+            if let actual = try? await readPreference(probe) {
                 deletionAlreadySatisfied = !actual.wasPresent
             }
         }
-        return ActionResult(
-            action: "restore preference",
-            target: target,
-            outcome: result.succeeded || deletionAlreadySatisfied ? .succeeded : .failed,
-            detail: result.succeeded || deletionAlreadySatisfied
-                ? (stored.wasPresent ? "Restored saved value." : "Restored key absence.")
-                : commandFailure(result)
+        return (
+            ActionResult(
+                action: "restore preference",
+                target: target,
+                outcome: result.succeeded || deletionAlreadySatisfied ? .succeeded : .failed,
+                detail: result.succeeded || deletionAlreadySatisfied
+                    ? (stored.wasPresent ? "Restored saved value." : "Restored key absence.")
+                    : commandFailure(result)
+            ),
+            true
         )
     }
 
@@ -578,10 +608,9 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
     }
 
-    private func synchronizeProcesses(for preferences: [PreferenceAction]) async -> [ActionResult] {
-        let processNames = Set(preferences.compactMap(\.synchronizeProcess)).sorted()
+    private func synchronizeProcesses(_ processNames: Set<String>) async -> [ActionResult] {
         var results: [ActionResult] = []
-        for name in processNames {
+        for name in processNames.sorted() {
             let result = await commands.run("/usr/bin/killall", arguments: [name], timeout: 3)
             results.append(
                 ActionResult(

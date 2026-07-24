@@ -60,12 +60,14 @@ struct MacSystemControllerStopTests {
         #expect(!results.contains(where: { $0.outcome.blocksCompletion }))
     }
 
-    @Test("defaults read retries transient cfprefsd failures")
-    func defaultsReadRetriesTransientFailures() async {
-        let commands = FlakyDefaultsCommandRunner(failuresBeforeSuccess: 2)
+    @Test("preference writes retry transient cfprefsd failures")
+    func defaultsWriteRetriesTransientFailures() async {
+        let state = PreferenceState(initial: [:])
+        let commands = FlakyWriteCommandRunner(state: state, failuresBeforeSuccess: 2)
         let controller = MacSystemController(
             commands: commands,
-            applications: StoppedApplicationManager()
+            applications: StoppedApplicationManager(),
+            preferences: FakePreferenceReader(state: state)
         )
         let preference = PreferenceAction(
             domain: "NSGlobalDomain",
@@ -81,20 +83,21 @@ struct MacSystemControllerStopTests {
             preferences: [preference]
         )
 
-        let snapshot = try? await controller.captureSnapshot(for: profile)
+        let results = await controller.apply(profile: profile)
 
-        #expect(snapshot?.preferences.first?.wasPresent == true)
-        #expect(snapshot?.preferences.first?.value == "0")
-        let readCalls = await commands.calls.filter { $0.contains("read") }
-        #expect(readCalls.count == 3)
+        let applyResults = results.filter { $0.action == "apply preference" }
+        #expect(applyResults.first?.outcome == .succeeded)
+        let writeCalls = await commands.calls.filter { $0.first == "write" }
+        #expect(writeCalls.count == 3)
     }
 
-    @Test("a missing defaults domain counts as key absence")
+    @Test("a missing preference domain counts as key absence")
     func missingDomainMeansAbsentKey() async throws {
-        let commands = MissingDomainDefaultsCommandRunner()
+        let state = PreferenceState(initial: [:])
         let controller = MacSystemController(
-            commands: commands,
-            applications: StoppedApplicationManager()
+            commands: FlakyWriteCommandRunner(state: state, failuresBeforeSuccess: 0),
+            applications: StoppedApplicationManager(),
+            preferences: FakePreferenceReader(state: state)
         )
         let preference = PreferenceAction(
             domain: "com.apple.dock",
@@ -113,6 +116,42 @@ struct MacSystemControllerStopTests {
         let snapshot = try await controller.captureSnapshot(for: profile)
 
         #expect(snapshot.preferences.first?.wasPresent == false)
+    }
+
+    @Test("no-op apply skips writes and never restarts synchronized processes")
+    func noOpApplySkipsWritesAndSynchronize() async {
+        let preference = PreferenceAction(
+            domain: "com.apple.dock",
+            key: "wvous-br-corner",
+            kind: .integer,
+            activeValue: "1",
+            synchronizeProcess: "Dock"
+        )
+        let state = PreferenceState(initial: [
+            PreferenceKey("com.apple.dock", "wvous-br-corner"): "1"
+        ])
+        let commands = FlakyWriteCommandRunner(state: state, failuresBeforeSuccess: 0)
+        let controller = MacSystemController(
+            commands: commands,
+            applications: StoppedApplicationManager(),
+            preferences: FakePreferenceReader(state: state)
+        )
+        let profile = CleanroomProfile(
+            name: "test",
+            applications: [],
+            services: [],
+            processes: [],
+            preferences: [preference]
+        )
+
+        let results = await controller.apply(profile: profile)
+
+        let applyResults = results.filter { $0.action == "apply preference" }
+        #expect(applyResults.first?.outcome == .skipped)
+        let calls = await commands.calls
+        #expect(!calls.contains { $0.first == "write" || $0.first == "delete" })
+        #expect(!calls.contains { $0.contains("killall") })
+        #expect(!results.contains { $0.action == "synchronize preferences" })
     }
 }
 
@@ -196,59 +235,56 @@ private actor UnloadingServiceCommandRunner: CommandRunning {
     }
 }
 
-/// Simulates transient cfprefsd contention: the first N reads exit 255, then
-/// the read succeeds.
-private actor FlakyDefaultsCommandRunner: CommandRunning {
+/// Simulates transient cfprefsd write contention: the first N writes exit
+/// 255, then writes succeed and mirror into the shared state.
+private actor FlakyWriteCommandRunner: CommandRunning {
     private(set) var calls: [[String]] = []
+    private let state: PreferenceState
     private var failuresRemaining: Int
 
-    init(failuresBeforeSuccess: Int) {
+    init(state: PreferenceState, failuresBeforeSuccess: Int) {
+        self.state = state
         failuresRemaining = failuresBeforeSuccess
     }
 
-    func run(_ executable: String, arguments: [String], timeout: TimeInterval) -> CommandResult {
+    func run(_ executable: String, arguments: [String], timeout: TimeInterval) async -> CommandResult {
         calls.append(arguments)
-        if arguments.first == "read", failuresRemaining > 0 {
-            failuresRemaining -= 1
-            return CommandResult(
-                executable: executable,
-                arguments: arguments,
-                exitCode: 255,
-                standardError: "Could not write domain; exiting"
-            )
+        switch executable {
+        case "/bin/launchctl":
+            return result(executable, arguments, exitCode: 113, error: "Could not find service")
+        case "/usr/bin/defaults":
+            if arguments.first == "write" {
+                if failuresRemaining > 0 {
+                    failuresRemaining -= 1
+                    return result(executable, arguments, exitCode: 255, error: "Could not write domain; exiting")
+                }
+                await state.write(PreferenceKey(arguments[1], arguments[2]), value: arguments[4])
+            }
+            if arguments.first == "delete" {
+                await state.delete(PreferenceKey(arguments[1], arguments[2]))
+            }
+            return result(executable, arguments, exitCode: 0)
+        default:
+            return result(executable, arguments, exitCode: 0)
         }
-        if arguments.first == "read" {
-            return CommandResult(
-                executable: executable,
-                arguments: arguments,
-                exitCode: 0,
-                standardOutput: "0\n"
-            )
-        }
-        return CommandResult(executable: executable, arguments: arguments, exitCode: 0)
     }
 
     func start(_ executable: String, arguments: [String]) -> CommandResult {
-        CommandResult(executable: executable, arguments: arguments, exitCode: 0)
-    }
-}
-
-/// Simulates `defaults read` against a domain that does not exist at all.
-private actor MissingDomainDefaultsCommandRunner: CommandRunning {
-    func run(_ executable: String, arguments: [String], timeout: TimeInterval) -> CommandResult {
-        if arguments.first == "read" {
-            return CommandResult(
-                executable: executable,
-                arguments: arguments,
-                exitCode: 1,
-                standardError: "Domain (com.apple.dock) not found.\nDefaults have not been changed."
-            )
-        }
-        return CommandResult(executable: executable, arguments: arguments, exitCode: 0)
+        result(executable, arguments, exitCode: 0)
     }
 
-    func start(_ executable: String, arguments: [String]) -> CommandResult {
-        CommandResult(executable: executable, arguments: arguments, exitCode: 0)
+    private func result(
+        _ executable: String,
+        _ arguments: [String],
+        exitCode: Int32,
+        error: String = ""
+    ) -> CommandResult {
+        CommandResult(
+            executable: executable,
+            arguments: arguments,
+            exitCode: exitCode,
+            standardError: error
+        )
     }
 }
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Entry no longer waits for preflight: inspection runs after the session is
+  secured for the non-gating profile, cutting roughly 1.5s off cleanroom
+  entry after Roblox launches.
+- Drift verification reads preferences in-process through CFPreferences, so
+  steady-state gameplay monitoring spawns no shell probes; preference writes
+  and `killall` synchronization now happen only when a value actually
+  changed, eliminating pointless Dock restarts.
+- Subprocess completion is delivered through `terminationHandler` instead of
+  a 20ms polling loop, removing the latency floor on every helper command.
+- The recovery journal is signature-cached, the event log is tail-read, and
+  the menu app publishes only when values change instead of re-rendering on
+  every two-second poll.
+- The menu refreshes immediately when opened and adds keyboard shortcuts for
+  preflight, entry, restore, and the dashboard.
+- Agent liveness repair is staged: kickstart revives an unloaded job, a status
+  probe spares a healthy-but-busy agent, and only a wedged job is booted out
+  and forcibly re-registered. Registration refreshes boot the old job out
+  first, so a replaced app bundle can no longer leave the agent crash-looping
+  on an unresolvable program path.
+
 ## 3.1.0
 
 - Restoration after Roblox quits is never blocked by a failed entry: automatic

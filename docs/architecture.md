@@ -70,10 +70,16 @@ Karabiner DriverKit services remain operator-controlled.
 ## Runtime cost
 
 Roblox presence and managed application state use `NSRunningApplication`.
-Steady idle monitoring launches no AppleScript or shell probes. Heartbeat writes
-are bounded to one every five seconds, event diagnostics are capped at 512 KiB,
-and the active drift verifier runs every fifteen seconds. Stop and restore work
-for independent helpers is launched concurrently.
+Preference inspection reads through CFPreferences in-process, and the journal
+is signature-cached, so steady idle and active monitoring launch no
+AppleScript or shell probes. Writes and process synchronization happen only
+when a preference value actually changes. Preflight inspection runs after
+entry for the non-gating profile so it never delays the transition. Heartbeat
+writes are bounded to one every five seconds, event diagnostics are capped at
+512 KiB and tail-read on query, and the active drift verifier runs every
+fifteen seconds. Stop and restore work for independent helpers is launched
+concurrently, and subprocess completion is delivered through
+`terminationHandler` rather than polling.
 
 ## Presentation settings
 

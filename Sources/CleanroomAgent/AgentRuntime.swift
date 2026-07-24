@@ -18,13 +18,15 @@ actor AgentRuntime {
 
     init(
         controller: MacSystemController,
-        preferencesStore: any RuntimePreferencesPersisting = FileRuntimePreferencesStore()
+        preferencesStore: any RuntimePreferencesPersisting = FileRuntimePreferencesStore(),
+        automaticRestoreDebounce: Int = 5
     ) {
         self.controller = controller
         self.engine = CleanroomEngine(
             profile: .phantomForces(),
             system: controller,
-            journalStore: FileRecoveryJournalStore()
+            journalStore: FileRecoveryJournalStore(),
+            automaticRestoreDebounce: automaticRestoreDebounce
         )
         self.diagnostics = DiagnosticsStore()
         self.preferencesStore = preferencesStore

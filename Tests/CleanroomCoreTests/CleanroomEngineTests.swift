@@ -170,6 +170,136 @@ struct CleanroomEngineTests {
         #expect(!(await store.journalExists()))
         #expect((await trace.events).contains("restore"))
     }
+
+    @Test("failed entry rolls back to the snapshot and clears the journal")
+    func failedEntryRollsBackCleanly() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace)
+        let system = FakeSystem(trace: trace, applyFails: true)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store
+        )
+
+        let report = await engine.enter()
+
+        #expect(report.phase == .idle)
+        #expect(!(await store.journalExists()))
+        let events = await trace.events
+        #expect(events.firstIndex(of: "save-journal")! < events.firstIndex(of: "restore")!)
+        #expect(await trace.count(of: "restore") == 1)
+
+        // Automatic re-entry is suppressed until an explicit retry; the monitor
+        // loop must not enter/rollback in a hot loop while Roblox stays open.
+        let automatic = await engine.reconcile()
+        #expect(automatic.phase == .degraded)
+        #expect(await trace.count(of: "apply") == 1)
+
+        _ = await engine.recover(.retryEntry)
+        #expect(await trace.count(of: "apply") == 2)
+    }
+
+    @Test("failed rollback retains the journal and suppresses automatic entry and restore")
+    func failedRollbackSuppressesBothDirections() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace)
+        let system = FakeSystem(trace: trace, restoreFails: true, applyFails: true)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store
+        )
+
+        let report = await engine.enter()
+        #expect(report.phase == .degraded)
+        #expect(await store.journalExists())
+        #expect(await trace.count(of: "restore") == 1)
+
+        await system.setTriggerState(.running)
+        let running = await engine.reconcile()
+        #expect(running.phase == .degraded)
+        #expect(await trace.count(of: "apply") == 1)
+
+        await system.setTriggerState(.stopped)
+        let stopped = await engine.reconcile()
+        #expect(stopped.phase == .degraded)
+        #expect(await trace.count(of: "restore") == 1)
+
+        _ = await engine.recover(.retryRestore)
+        #expect(await trace.count(of: "restore") == 2)
+    }
+
+    @Test("failed drift repair does not block restoration when Roblox quits")
+    func driftFailureDoesNotBlockRestoreOnQuit() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace, journal: .fixture)
+        let system = FakeSystem(trace: trace, alwaysFailVerification: true)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store
+        )
+
+        let drift = await engine.enforceActive()
+        #expect(drift.phase == .degraded)
+
+        await system.setTriggerState(.stopped)
+        let report = await engine.reconcile()
+
+        #expect(report.phase == .idle)
+        #expect(!(await store.journalExists()))
+        #expect(await trace.count(of: "restore") == 1)
+    }
+
+    @Test("automatic restore waits for a stable Roblox exit")
+    func automaticRestoreIsDebounced() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace, journal: .fixture)
+        let system = FakeSystem(trace: trace, triggerState: .stopped)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store,
+            automaticRestoreDebounce: 2
+        )
+
+        _ = await engine.reconcile()
+        #expect(await trace.count(of: "restore") == 0)
+        _ = await engine.reconcile()
+        #expect(await trace.count(of: "restore") == 0)
+
+        let third = await engine.reconcile()
+        #expect(third.phase == .idle)
+        #expect(await trace.count(of: "restore") == 1)
+        #expect(!(await store.journalExists()))
+    }
+
+    @Test("a Roblox relaunch resets the exit-stability debounce")
+    func relaunchResetsDebounce() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace, journal: .fixture)
+        let system = FakeSystem(trace: trace, triggerState: .stopped)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store,
+            automaticRestoreDebounce: 1
+        )
+
+        _ = await engine.reconcile()
+        #expect(await trace.count(of: "restore") == 0)
+
+        await system.setTriggerState(.running)
+        _ = await engine.reconcile()
+        await system.setTriggerState(.stopped)
+        _ = await engine.reconcile()
+        #expect(await trace.count(of: "restore") == 0)
+
+        let settled = await engine.reconcile()
+        #expect(settled.phase == .idle)
+        #expect(await trace.count(of: "restore") == 1)
+    }
 }
 
 private actor Trace {
@@ -216,19 +346,29 @@ private actor MemoryJournalStore: RecoveryJournalPersisting {
 private actor FakeSystem: CleanroomSystemControlling {
     private let trace: Trace
     private let restoreFails: Bool
-    private let triggerState: ProbeState
+    private let applyFails: Bool
+    private let alwaysFailVerification: Bool
+    private var triggerState: ProbeState
     private var verificationFailuresRemaining: Int
 
     init(
         trace: Trace,
         restoreFails: Bool = false,
+        applyFails: Bool = false,
+        alwaysFailVerification: Bool = false,
         triggerState: ProbeState = .running,
         verificationFailsOnce: Bool = false
     ) {
         self.trace = trace
         self.restoreFails = restoreFails
+        self.applyFails = applyFails
+        self.alwaysFailVerification = alwaysFailVerification
         self.triggerState = triggerState
         self.verificationFailuresRemaining = verificationFailsOnce ? 1 : 0
+    }
+
+    func setTriggerState(_ state: ProbeState) {
+        triggerState = state
     }
 
     func probeTrigger() -> TriggerProbe {
@@ -256,11 +396,17 @@ private actor FakeSystem: CleanroomSystemControlling {
 
     func apply(profile: CleanroomProfile) async -> [ActionResult] {
         await trace.append("apply")
+        if applyFails {
+            return [.init(action: "apply", target: profile.name, outcome: .failed, detail: "apply failed")]
+        }
         return [.init(action: "apply", target: profile.name, outcome: .succeeded, detail: "ok")]
     }
 
     func verifyApplied(profile: CleanroomProfile) async -> [ActionResult] {
         await trace.append("verify")
+        if alwaysFailVerification {
+            return [.init(action: "verify", target: profile.name, outcome: .failed, detail: "drift")]
+        }
         if verificationFailuresRemaining > 0 {
             verificationFailuresRemaining -= 1
             return [.init(action: "verify", target: profile.name, outcome: .failed, detail: "drift")]

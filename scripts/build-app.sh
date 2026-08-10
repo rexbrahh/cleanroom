@@ -4,9 +4,20 @@ set -euo pipefail
 ROOT="${0:A:h:h}"
 CONFIGURATION="${CONFIGURATION:-release}"
 SIGN_IDENTITY="${CLEANROOM_SIGN_IDENTITY:--}"
-VERSION="${CLEANROOM_VERSION:-3.1.0}"
-BUILD_NUMBER="${CLEANROOM_BUILD_NUMBER:-5}"
+DEFAULT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/Resources/Info.plist")"
+DEFAULT_BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$ROOT/Resources/Info.plist")"
+VERSION="${CLEANROOM_VERSION:-$DEFAULT_VERSION}"
+BUILD_NUMBER="${CLEANROOM_BUILD_NUMBER:-$DEFAULT_BUILD_NUMBER}"
 APP="$ROOT/dist/Cleanroom.app"
+
+if [[ ! "$VERSION" =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
+  print -u2 -r -- "Invalid Cleanroom version '$VERSION'; expected MAJOR.MINOR.PATCH."
+  exit 1
+fi
+if [[ ! "$BUILD_NUMBER" =~ '^[1-9][0-9]*$' ]]; then
+  print -u2 -r -- "Invalid Cleanroom build '$BUILD_NUMBER'; expected a positive integer."
+  exit 1
+fi
 
 cd "$ROOT"
 swift build -c "$CONFIGURATION"
@@ -45,10 +56,13 @@ else
   SIGN_ARGS+=(--timestamp)
 fi
 
-/usr/bin/codesign "${SIGN_ARGS[@]}" "$APP/Contents/Library/LaunchServices/cleanroom-agent"
-/usr/bin/codesign "${SIGN_ARGS[@]}" "$APP/Contents/Resources/cleanroomctl"
+/usr/bin/codesign "${SIGN_ARGS[@]}" --identifier com.rex.cleanroom.agent \
+  "$APP/Contents/Library/LaunchServices/cleanroom-agent"
+/usr/bin/codesign "${SIGN_ARGS[@]}" --identifier com.rex.cleanroom.cli \
+  "$APP/Contents/Resources/cleanroomctl"
 /usr/bin/codesign "${SIGN_ARGS[@]}" "$APP/Contents/MacOS/Cleanroom"
 /usr/bin/codesign "${SIGN_ARGS[@]}" "$APP"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+"$ROOT/scripts/validate-build-version.sh" "$APP" "$VERSION" "$BUILD_NUMBER"
 
 print -r -- "$APP"

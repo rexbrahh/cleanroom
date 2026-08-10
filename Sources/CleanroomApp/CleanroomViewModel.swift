@@ -10,6 +10,25 @@ import ServiceManagement
 import UniformTypeIdentifiers
 @preconcurrency import UserNotifications
 
+enum AgentLivenessRepairTrigger {
+    case automaticFailure
+    case userRequestedReplacement
+
+    var permitsDestructiveReplacement: Bool {
+        self == .userRequestedReplacement
+    }
+}
+
+struct SetupDoctorState: Equatable {
+    let agentRegistered: Bool
+    let xpcConnected: Bool
+    let menuItemConfirmed: Bool
+
+    var canComplete: Bool {
+        agentRegistered && xpcConnected && menuItemConfirmed
+    }
+}
+
 @MainActor
 final class CleanroomViewModel: ObservableObject {
     @Published var status: CleanroomStatus?
@@ -17,12 +36,32 @@ final class CleanroomViewModel: ObservableObject {
     @Published var operationInProgress = false
     @Published var connectionMessage = "Starting Cleanroom agent…"
     @Published var registrationMessage = "Checking background-agent registration…"
+    @Published var agentRegistrationReady = false
     @Published var presentingDiscardConfirmation = false
     @Published var recentEvents: [TransitionReport] = []
+    @Published var performanceTimeline: [SessionPerformanceRecord] = []
+    @Published var networkLatency: NetworkLatencyReport?
+    @Published var systemPressure: SystemPressureSample?
+    @Published var recoveryHistory: [RecoveryReceipt] = []
+    @Published var profiles: [CleanroomProfileSummary] = []
+    @Published var profileDraftName = "Custom competitive profile"
+    @Published var profileDraftTriggerBundleIdentifier = "com.example.Game"
+    @Published var profileValidation: ProfileValidationReport?
+    @Published var calibrationHardwareIdentifier = "unknown"
+    @Published var calibrationPointerLinearEnabled = true
+    @Published var calibrationDisplayRefreshRateHertz = 120
+    @Published var calibrationRestoreDebounceSeconds = 5.0
+    @Published var profileImportPreview: ProfileImportPreview?
     @Published var notificationsEnabled: Bool
+    @Published var performanceAlertsEnabled: Bool
+    @Published var thermalAlertThreshold: ThermalPressureLevel
+    @Published var batteryAlertThreshold: Int
+    @Published var updateChannel: CleanroomUpdateChannel
     @Published var notificationMessage = "Gameplay notifications are off"
     @Published var launchAtLoginEnabled = false
     @Published var launchAtLoginMessage = "Checking menu-app launch at login…"
+    @Published var setupDoctorVisible: Bool
+    @Published var menuItemConfirmed: Bool
 
     private let client = CleanroomAgentClient()
     private let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
@@ -32,8 +71,16 @@ final class CleanroomViewModel: ObservableObject {
     private var lastRegistrationRepairAt = Date.distantPast
     private var statusPollCount = 0
     private var previousPhase: CleanroomPhase?
+    private var pressureAlertGate = SystemPressureAlertGate()
+    private let profileDraftIdentifier = "custom-\(UUID().uuidString.lowercased())"
 
     private static let notificationsPreferenceKey = "recoveryNotificationsEnabled"
+    private static let performanceAlertsPreferenceKey = "performanceAlertsEnabled"
+    private static let thermalThresholdPreferenceKey = "thermalAlertThreshold"
+    private static let batteryThresholdPreferenceKey = "batteryAlertThreshold"
+    private static let updateChannelPreferenceKey = "updateChannel"
+    private static let setupCompletedPreferenceKey = "setupDoctorCompleted"
+    private static let menuItemConfirmedPreferenceKey = "setupDoctorMenuItemConfirmed"
 
     init() {
         // Keep ServiceManagement and UserNotifications IPC out of the app's
@@ -41,6 +88,23 @@ final class CleanroomViewModel: ObservableObject {
         notificationsEnabled = UserDefaults.standard.bool(
             forKey: Self.notificationsPreferenceKey
         )
+        performanceAlertsEnabled = UserDefaults.standard.bool(
+            forKey: Self.performanceAlertsPreferenceKey
+        )
+        let savedThermalThreshold = ThermalPressureLevel(
+            rawValue: UserDefaults.standard.integer(forKey: Self.thermalThresholdPreferenceKey))
+        thermalAlertThreshold =
+            savedThermalThreshold == .critical || savedThermalThreshold == .serious
+            ? savedThermalThreshold! : .serious
+        let savedBatteryThreshold = UserDefaults.standard.integer(
+            forKey: Self.batteryThresholdPreferenceKey)
+        batteryAlertThreshold = savedBatteryThreshold == 0 ? 20 : savedBatteryThreshold
+        updateChannel =
+            CleanroomUpdateChannel(
+                rawValue: UserDefaults.standard.string(forKey: Self.updateChannelPreferenceKey)
+                    ?? "stable") ?? .stable
+        setupDoctorVisible = !UserDefaults.standard.bool(forKey: Self.setupCompletedPreferenceKey)
+        menuItemConfirmed = UserDefaults.standard.bool(forKey: Self.menuItemConfirmedPreferenceKey)
     }
 
     enum AgentHealth {
@@ -68,7 +132,8 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     var phaseTitle: String {
-        switch status?.phase {
+        if status?.incidentMode == true { return "Incident Mode active" }
+        return switch status?.phase {
         case .active: "Competitive mode active"
         case .entering: "Preparing competitive mode"
         case .restoring: "Restoring desktop state"
@@ -100,6 +165,48 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
+    var diagnosticsHealthMessage: String? {
+        guard let health = status?.diagnosticsHealth, !health.isHealthy else { return nil }
+        return [health.eventLogError, health.heartbeatError, health.eventReadError]
+            .compactMap { $0 }
+            .joined(separator: "; ")
+    }
+
+    var setupDoctorState: SetupDoctorState {
+        SetupDoctorState(
+            agentRegistered: agentRegistrationReady,
+            xpcConnected: status != nil,
+            menuItemConfirmed: menuItemConfirmed
+        )
+    }
+
+    var profileDraft: CleanroomProfile {
+        let template = CleanroomProfile.phantomForces()
+        return CleanroomProfile(
+            identifier: profileDraftIdentifier,
+            name: profileDraftName,
+            triggerBundleIdentifier: profileDraftTriggerBundleIdentifier,
+            applications: template.applications,
+            services: template.services,
+            processes: template.processes,
+            preferences: template.preferences,
+            processCPUWarningPercent: template.processCPUWarningPercent,
+            processCPUCriticalPercent: template.processCPUCriticalPercent,
+            blockAutomaticEntryOnCriticalPreflight: template.blockAutomaticEntryOnCriticalPreflight
+        )
+    }
+
+    func confirmMenuItemVisible() {
+        menuItemConfirmed = true
+        UserDefaults.standard.set(true, forKey: Self.menuItemConfirmedPreferenceKey)
+    }
+
+    func completeSetupDoctor() {
+        guard setupDoctorState.canComplete else { return }
+        setupDoctorVisible = false
+        UserDefaults.standard.set(true, forKey: Self.setupCompletedPreferenceKey)
+    }
+
     var sessionDetail: String {
         guard let journal = status?.journal else { return "No saved gameplay session" }
         let elapsed = max(0, Int(Date().timeIntervalSince(journal.createdAt)))
@@ -110,18 +217,18 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     var preflightSummary: String {
-        guard let findings = preflight?.findings else { return "Preflight has not run" }
+        guard let preflight else { return "Preflight has not run" }
+        guard preflight.isFreshAndComplete() else { return "Preflight incomplete or stale" }
+        let findings = preflight.findings
         let critical = findings.count { $0.severity == .critical }
         let warnings = findings.count { $0.severity == .warning }
         if critical > 0 { return "\(critical) critical · \(warnings) warnings" }
         if warnings > 0 { return "\(warnings) warnings" }
-        return "Ready"
+        return preflight.isReady() ? "Ready" : "Preflight needs review"
     }
 
     var appVersion: String {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-        return "\(version ?? "development") (\(build ?? "local"))"
+        CleanroomBuildIdentity.current.description
     }
 
     func start() {
@@ -130,8 +237,10 @@ final class CleanroomViewModel: ObservableObject {
         logger.notice("View model started; refreshing registration state")
         Task { [weak self] in
             await self?.refreshAgentRegistration()
+            await self?.refreshProfiles()
+            await self?.refreshCalibration()
             await self?.refreshNotificationAuthorization()
-            await self?.refreshLaunchAtLoginStatus()
+            self?.refreshLaunchAtLoginStatus()
         }
         pollingTask = Task { [weak self] in
             guard let self else { return }
@@ -144,11 +253,17 @@ final class CleanroomViewModel: ObservableObject {
 
     func registerAgent() {
         Task { [weak self] in
-            await self?.refreshAgentRegistration(force: true)
+            await self?.refreshAgentRegistration(
+                force: true,
+                trigger: .userRequestedReplacement
+            )
         }
     }
 
-    private func refreshAgentRegistration(force: Bool = false, forceReregister: Bool = false) async {
+    private func refreshAgentRegistration(
+        force: Bool = false,
+        trigger: AgentLivenessRepairTrigger = .automaticFailure
+    ) async {
         guard !registrationInProgress else { return }
         registrationInProgress = true
         defer { registrationInProgress = false }
@@ -159,7 +274,8 @@ final class CleanroomViewModel: ObservableObject {
         do {
             switch service.status {
             case .enabled:
-                if digest == nil || registeredDigest != digest || forceReregister {
+                if trigger.permitsDestructiveReplacement {
+                    agentRegistrationReady = false
                     registrationMessage = "Refreshing background-agent registration…"
                     // Boot the old job out first: a job bound to a replaced
                     // bundle can survive unregister/register and keep
@@ -174,14 +290,21 @@ final class CleanroomViewModel: ObservableObject {
                     try service.register()
                     if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
                     registrationMessage = "Background agent updated and enabled"
+                    agentRegistrationReady = true
+                } else if digest == nil || registeredDigest != digest {
+                    registrationMessage =
+                        "Agent bundle changed; use Replace Agent Registration when no transition is running"
+                    agentRegistrationReady = false
                 } else {
                     registrationMessage =
                         force
                         ? "Background agent is registered; connection recovery is pending"
                         : "Background agent enabled"
+                    agentRegistrationReady = true
                 }
             case .requiresApproval:
                 registrationMessage = "Background agent requires approval in Login Items"
+                agentRegistrationReady = false
             case .notRegistered, .notFound:
                 try service.register()
                 if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
@@ -189,11 +312,14 @@ final class CleanroomViewModel: ObservableObject {
                     service.status == .requiresApproval
                     ? "Background agent requires approval in Login Items"
                     : "Background agent registered"
+                agentRegistrationReady = service.status == .enabled
             @unknown default:
                 registrationMessage = "Background-agent status is unknown"
+                agentRegistrationReady = false
             }
         } catch {
             registrationMessage = "Agent registration failed: \(error.localizedDescription)"
+            agentRegistrationReady = false
             logger.error("Agent registration failed: \(error.localizedDescription, privacy: .public)")
         }
     }
@@ -244,6 +370,13 @@ final class CleanroomViewModel: ObservableObject {
             statusPollCount += 1
             if statusPollCount == 1 || statusPollCount.isMultiple(of: 5) {
                 await refreshEvents()
+                await refreshRecoveryHistory()
+                await refreshPerformanceTimeline()
+                if status.phase == .active {
+                    await refreshSystemPressure()
+                } else {
+                    pressureAlertGate = SystemPressureAlertGate()
+                }
             }
         } catch {
             let message = "Agent unavailable: \(error.localizedDescription)"
@@ -252,6 +385,7 @@ final class CleanroomViewModel: ObservableObject {
             }
             connectionMessage = message
             await client.invalidate()
+            if status?.incidentMode == true { return }
             if Date().timeIntervalSince(lastRegistrationRepairAt) >= 30 {
                 lastRegistrationRepairAt = Date()
                 await repairAgentLiveness()
@@ -259,13 +393,9 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
-    /// The BTM registration can report "enabled" while launchd has no live
-    /// job for the agent, or a wedged job that crash-loops because its
-    /// relative BundleProgram no longer resolves after the app bundle was
-    /// replaced. Repair in stages: kickstart revives an unloaded job and is
-    /// harmless to a healthy agent; a status probe then distinguishes a busy
-    /// agent from a dead one; only a wedged job is booted out and forcibly
-    /// re-registered.
+    /// Automatic repair is deliberately non-destructive: kickstart can revive
+    /// an unloaded job without terminating a live transition. Replacement is
+    /// reserved for the explicit UI action.
     private func repairAgentLiveness() async {
         _ = await LocalCommandRunner().run(
             "/bin/launchctl",
@@ -276,13 +406,9 @@ final class CleanroomViewModel: ObservableObject {
             logger.notice("Agent answered after kickstart; no re-registration needed")
             return
         }
-        logger.notice("Agent still unreachable after kickstart; booting out and re-registering")
-        _ = await LocalCommandRunner().run(
-            "/bin/launchctl",
-            arguments: ["bootout", "gui/\(getuid())/com.rex.cleanroom.agent"],
-            timeout: 5
-        )
-        await refreshAgentRegistration(force: true, forceReregister: true)
+        registrationMessage =
+            "Agent unreachable after non-destructive repair; replace its registration only when no transition is running"
+        logger.error("Agent still unreachable after non-destructive kickstart")
     }
 
     private func probeAgent() async -> Bool {
@@ -316,6 +442,189 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
+    func refreshRecoveryHistory() async {
+        do {
+            let response = try await client.send(.recoveryReceipts(limit: 3))
+            guard case .recoveryReceipts(let receipts) = response.payload else { return }
+            if recoveryHistory != receipts { recoveryHistory = receipts }
+        } catch {
+            await client.invalidate()
+        }
+    }
+
+    func refreshPerformanceTimeline() async {
+        do {
+            let response = try await client.send(.performanceTimeline(limit: 30))
+            guard case .performanceTimeline(let records) = response.payload else { return }
+            if performanceTimeline != records { performanceTimeline = records }
+        } catch {
+            await client.invalidate()
+        }
+    }
+
+    func sampleNetworkLatency() {
+        perform(.networkLatency(sampleCount: 5))
+    }
+
+    func performGlobalHotKey(_ action: GlobalHotKeyAction) {
+        switch action {
+        case .status:
+            Task { await refreshStatus() }
+        case .preflight:
+            runPreflight()
+        case .safeLaunch:
+            safeLaunch()
+        case .togglePause:
+            togglePause()
+        case .restore:
+            restore()
+        }
+    }
+
+    func refreshSystemPressure() async {
+        do {
+            let response = try await client.send(.systemPressure)
+            guard case .systemPressure(let sample) = response.payload else { return }
+            systemPressure = sample
+            guard performanceAlertsEnabled else { return }
+            let thresholds = SystemAlertThresholds(
+                thermal: thermalAlertThreshold,
+                batteryPercent: batteryAlertThreshold
+            )
+            for alert in pressureAlertGate.crossings(for: sample, thresholds: thresholds) {
+                switch alert {
+                case .thermal:
+                    deliverNotification(
+                        title: "Thermal pressure threshold reached",
+                        body: "macOS reports \(sample.thermal) thermal pressure during this session."
+                    )
+                case .battery:
+                    deliverNotification(
+                        title: "Battery threshold reached",
+                        body: "Battery is at \(sample.batteryPercent ?? 0)% and is not on AC power."
+                    )
+                }
+            }
+        } catch {
+            await client.invalidate()
+        }
+    }
+
+    func setPerformanceAlertsEnabled(_ enabled: Bool) {
+        if !enabled {
+            performanceAlertsEnabled = false
+            UserDefaults.standard.set(false, forKey: Self.performanceAlertsPreferenceKey)
+            pressureAlertGate = SystemPressureAlertGate()
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let granted =
+                (try? await UNUserNotificationCenter.current().requestAuthorization(
+                    options: [.alert, .sound])) ?? false
+            performanceAlertsEnabled = granted
+            UserDefaults.standard.set(granted, forKey: Self.performanceAlertsPreferenceKey)
+        }
+    }
+
+    func savePerformanceAlertThresholds() {
+        UserDefaults.standard.set(
+            thermalAlertThreshold.rawValue, forKey: Self.thermalThresholdPreferenceKey)
+        UserDefaults.standard.set(batteryAlertThreshold, forKey: Self.batteryThresholdPreferenceKey)
+        pressureAlertGate = SystemPressureAlertGate()
+    }
+
+    func setUpdateChannel(_ channel: CleanroomUpdateChannel) {
+        updateChannel = channel
+        UserDefaults.standard.set(channel.rawValue, forKey: Self.updateChannelPreferenceKey)
+    }
+
+    func refreshProfiles() async {
+        do {
+            let response = try await client.send(.profiles)
+            guard case .profiles(let profiles) = response.payload else { return }
+            if self.profiles != profiles { self.profiles = profiles }
+        } catch {
+            await client.invalidate()
+        }
+    }
+
+    func selectProfile(_ identifier: String) {
+        perform(.selectProfile(identifier))
+    }
+
+    func validateProfileDraft() {
+        perform(.validateProfile(profileDraft))
+    }
+
+    func saveProfileDraft() {
+        perform(.saveProfile(profileDraft))
+    }
+
+    func refreshCalibration() async {
+        do {
+            let response = try await client.send(.deviceCalibration)
+            guard case .deviceCalibration(let calibration) = response.payload,
+                let calibration
+            else { return }
+            applyCalibration(calibration)
+        } catch {
+            await client.invalidate()
+        }
+    }
+
+    func saveCalibration() {
+        perform(
+            .saveDeviceCalibration(
+                DeviceCalibration(
+                    hardwareIdentifier: calibrationHardwareIdentifier,
+                    pointerLinearEnabled: calibrationPointerLinearEnabled,
+                    preferredDisplayRefreshRateHertz: calibrationDisplayRefreshRateHertz,
+                    automaticRestoreDebounceSeconds: calibrationRestoreDebounceSeconds
+                )
+            )
+        )
+    }
+
+    func importProfile() {
+        let panel = NSOpenPanel()
+        panel.title = "Preview Cleanroom Profile Import"
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url)
+            perform(.previewProfileImport(data))
+        } catch {
+            connectionMessage = "Profile import could not be read: \(error.localizedDescription)"
+        }
+    }
+
+    func confirmProfileImport() {
+        guard let preview = profileImportPreview, preview.canImport else { return }
+        perform(.saveProfile(preview.profile))
+    }
+
+    func exportActiveProfile() {
+        guard let identifier = status?.activeProfile?.identifier else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await client.send(.exportProfile(identifier))
+                guard case .profileExport(let data) = response.payload else { return }
+                let panel = NSSavePanel()
+                panel.title = "Export Cleanroom Profile"
+                panel.nameFieldStringValue = "\(identifier).cleanroom-profile.json"
+                panel.allowedContentTypes = [.json]
+                guard panel.runModal() == .OK, let url = panel.url else { return }
+                try data.write(to: url, options: .atomic)
+                connectionMessage = "Profile exported to \(url.lastPathComponent)."
+            } catch {
+                connectionMessage = "Profile export failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func runPreflight() {
         perform(.preflight)
     }
@@ -326,6 +635,10 @@ final class CleanroomViewModel: ObservableObject {
 
     func restore() {
         perform(.restore)
+    }
+
+    func safeLaunch() {
+        perform(.safeLaunch)
     }
 
     func togglePause() {
@@ -341,7 +654,19 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     func discardJournal() {
-        perform(.recover(.discardJournal))
+        perform(.recover(.discardJournal), destructiveRecoveryConfirmed: true)
+    }
+
+    func enterIncidentMode() {
+        perform(.setIncidentMode(true))
+        Task { [weak self] in
+            await self?.refreshEvents()
+            await self?.refreshRecoveryHistory()
+        }
+    }
+
+    func exitIncidentMode() {
+        perform(.setIncidentMode(false))
     }
 
     func migrateLegacy() {
@@ -439,15 +764,54 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
-    private func perform(_ command: AgentCommand) {
+    func exportSupportBundle() {
+        let panel = NSSavePanel()
+        panel.title = "Export Redacted Cleanroom Support Bundle"
+        panel.nameFieldStringValue = "Cleanroom-support.zip"
+        panel.allowedContentTypes = [.zip]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        operationInProgress = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { operationInProgress = false }
+            await refreshStatus()
+            await refreshEvents()
+            await refreshRecoveryHistory()
+            await refreshPerformanceTimeline()
+            let document = SupportBundleRedactor.makeDocument(
+                appVersion: appVersion,
+                status: status,
+                preflight: preflight,
+                events: recentEvents,
+                receipts: recoveryHistory,
+                performance: performanceTimeline
+            )
+            do {
+                try await SupportBundleArchive.write(document, to: url)
+                connectionMessage = "Redacted local support bundle exported; nothing was submitted."
+            } catch {
+                connectionMessage = "Support bundle export failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func perform(
+        _ command: AgentCommand,
+        destructiveRecoveryConfirmed: Bool = false
+    ) {
         guard !operationInProgress else { return }
         operationInProgress = true
         Task { [weak self] in
             guard let self else { return }
             defer { operationInProgress = false }
             do {
-                let response = try await client.send(command)
+                let response = try await client.send(
+                    command,
+                    destructiveRecoveryConfirmed: destructiveRecoveryConfirmed
+                )
                 switch response.payload {
+                case .handshake(let handshake):
+                    connectionMessage = handshake.incompatibility ?? "Agent capabilities negotiated."
                 case .status(let status):
                     self.status = status
                 case .transition(let report):
@@ -458,6 +822,37 @@ final class CleanroomViewModel: ObservableObject {
                     connectionMessage = "Competitive preflight completed."
                 case .events(let events):
                     recentEvents = events.reversed()
+                case .performanceTimeline(let records):
+                    performanceTimeline = records
+                case .networkLatency(let report):
+                    networkLatency = report
+                    connectionMessage = report.error ?? "Read-only latency sample completed."
+                case .systemPressure(let sample):
+                    systemPressure = sample
+                case .recoveryReceipts(let receipts):
+                    recoveryHistory = receipts
+                case .profiles(let profiles):
+                    self.profiles = profiles
+                case .profileValidation(let report):
+                    profileValidation = report
+                    connectionMessage =
+                        report.isValid
+                        ? "Profile validation passed with \(report.mutations.count) mutation targets."
+                        : report.errors.joined(separator: " ")
+                    await refreshProfiles()
+                case .deviceCalibration(let calibration):
+                    if let calibration { applyCalibration(calibration) }
+                    connectionMessage = "Device calibration saved for this Mac."
+                case .profileExport:
+                    break
+                case .profileImportPreview(let preview):
+                    profileImportPreview = preview
+                    connectionMessage =
+                        preview.canImport
+                        ? "Profile import is valid; review the mutation diff before confirming."
+                        : preview.validation.errors.joined(separator: " ")
+                case .requestInProgress:
+                    connectionMessage = "The request is still running; its operation was not started twice."
                 case .failure(let message):
                     connectionMessage = message
                 }
@@ -473,11 +868,20 @@ final class CleanroomViewModel: ObservableObject {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         if settings.authorizationStatus == .denied {
             notificationsEnabled = false
+            performanceAlertsEnabled = false
             UserDefaults.standard.set(false, forKey: Self.notificationsPreferenceKey)
+            UserDefaults.standard.set(false, forKey: Self.performanceAlertsPreferenceKey)
             notificationMessage = "Notification permission is denied in System Settings"
         } else if notificationsEnabled {
             notificationMessage = "Recovery and degraded-state notifications are on"
         }
+    }
+
+    private func applyCalibration(_ calibration: DeviceCalibration) {
+        calibrationHardwareIdentifier = calibration.hardwareIdentifier
+        calibrationPointerLinearEnabled = calibration.pointerLinearEnabled
+        calibrationDisplayRefreshRateHertz = calibration.preferredDisplayRefreshRateHertz
+        calibrationRestoreDebounceSeconds = calibration.automaticRestoreDebounceSeconds
     }
 
     private func handlePhaseTransition(to phase: CleanroomPhase) {
@@ -525,6 +929,8 @@ final class CleanroomViewModel: ObservableObject {
             let status: CleanroomStatus?
             let preflight: PreflightReport?
             let recentEvents: [TransitionReport]
+            let performanceTimeline: [SessionPerformanceRecord]
+            let recoveryHistory: [RecoveryReceipt]
             let networkMutationPolicy: String
         }
 
@@ -535,6 +941,8 @@ final class CleanroomViewModel: ObservableObject {
                 status: status,
                 preflight: preflight,
                 recentEvents: recentEvents,
+                performanceTimeline: performanceTimeline,
+                recoveryHistory: recoveryHistory,
                 networkMutationPolicy: "read-only preflight; no network mutation"
             )
         )

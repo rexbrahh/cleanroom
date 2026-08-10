@@ -4,9 +4,11 @@ import OSLog
 import SwiftUI
 
 @main
+@MainActor
 struct CleanroomApp: App {
     @NSApplicationDelegateAdaptor(CleanroomAppDelegate.self) private var delegate
     @StateObject private var model: CleanroomViewModel
+    private let hotKeys: GlobalHotKeyController
     private static let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
 
     init() {
@@ -14,6 +16,7 @@ struct CleanroomApp: App {
         Self.logger.notice("Cleanroom menu app launched")
         let model = CleanroomViewModel()
         _model = StateObject(wrappedValue: model)
+        hotKeys = GlobalHotKeyController { action in model.performGlobalHotKey(action) }
         model.start()
     }
 
@@ -101,13 +104,22 @@ private struct CleanroomMenu: View {
             Button("Enter / Re-enforce") { model.enter() }
                 .disabled(model.operationInProgress)
                 .keyboardShortcut("e")
+            Button("Safe Launch Roblox") { model.safeLaunch() }
+                .disabled(model.operationInProgress || model.status?.trigger.state != .stopped)
             Button("Restore Saved State") { model.restore() }
                 .disabled(model.operationInProgress || model.status?.journal == nil)
                 .keyboardShortcut("r")
             Button(model.status?.phase == .paused ? "Resume Automatic Control" : "Pause Automatic Control") {
                 model.togglePause()
             }
-            .disabled(model.operationInProgress)
+            .disabled(model.operationInProgress || model.status?.incidentMode == true)
+            Button(model.status?.incidentMode == true ? "Exit Incident Mode" : "Enter Incident Mode") {
+                if model.status?.incidentMode == true {
+                    model.exitIncidentMode()
+                } else {
+                    model.enterIncidentMode()
+                }
+            }
             Divider()
             Button("Open Cleanroom…") {
                 openWindow(id: "dashboard")
@@ -162,6 +174,9 @@ private struct DashboardView: View {
     private var sectionContent: some View {
         switch selectedSection ?? .overview {
         case .overview:
+            if model.setupDoctorVisible {
+                setupDoctorCard
+            }
             healthCard
             agentCard
             if model.status?.phase == .degraded || model.status?.journal != nil {
@@ -178,16 +193,30 @@ private struct DashboardView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Sample Latency") { model.sampleNetworkLatency() }
+                    .disabled(model.operationInProgress)
                 Button("Run Preflight") { model.runPreflight() }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.operationInProgress)
             }
             preflightCard
+            if let latency = model.networkLatency {
+                GroupBox("Active-route latency") {
+                    Text(
+                        latency.error
+                            ?? "\(latency.averageMilliseconds.map { String(format: "%.2f", $0) } ?? "—") ms average · \(latency.jitterMilliseconds.map { String(format: "%.2f", $0) } ?? "—") ms jitter · no network changes"
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
         case .activity:
             recentResults
+            recoveryHistoryCard
+            performanceTimelineCard
             activityCard
             diagnosticsCard
         case .policy:
+            profileEditorCard
             policyCard
         }
     }
@@ -212,6 +241,71 @@ private struct DashboardView: View {
                 systemImage: "checklist",
                 tint: readinessColor
             )
+        }
+    }
+
+    private var setupDoctorCard: some View {
+        GroupBox("First-run Setup Doctor") {
+            VStack(alignment: .leading, spacing: 12) {
+                setupRow(
+                    title: "Background agent registration",
+                    detail: model.registrationMessage,
+                    complete: model.agentRegistrationReady
+                )
+                setupRow(
+                    title: "Authenticated agent connection",
+                    detail: model.status == nil ? model.connectionMessage : "Live XPC status received",
+                    complete: model.status != nil
+                )
+                setupRow(
+                    title: "Notification permission",
+                    detail: model.notificationMessage,
+                    complete: model.notificationsEnabled
+                )
+                setupRow(
+                    title: "Login-item approval",
+                    detail: model.launchAtLoginMessage,
+                    complete: model.launchAtLoginEnabled
+                )
+                setupRow(
+                    title: "Menu-item checkpoint",
+                    detail: model.menuItemConfirmed
+                        ? "Menu-bar item confirmed manually"
+                        : "Open the menu-bar item, then confirm it is visible",
+                    complete: model.menuItemConfirmed
+                )
+                HStack {
+                    if !model.agentRegistrationReady {
+                        Button("Open Login Items") { model.openLoginItemsSettings() }
+                        Button("Replace Registration") { model.registerAgent() }
+                    }
+                    if !model.notificationsEnabled {
+                        Button("Enable Notifications") { model.setNotificationsEnabled(true) }
+                    }
+                    if !model.launchAtLoginEnabled {
+                        Button("Enable Launch at Login") { model.setLaunchAtLoginEnabled(true) }
+                    }
+                    if !model.menuItemConfirmed {
+                        Button("I Can See the Menu Item") { model.confirmMenuItemVisible() }
+                    }
+                    Spacer()
+                    Button("Finish Setup") { model.completeSetupDoctor() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.setupDoctorState.canComplete)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private func setupRow(title: String, detail: String, complete: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: complete ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(complete ? .green : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout.weight(.medium))
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -257,6 +351,11 @@ private struct DashboardView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    if let diagnostics = model.diagnosticsHealthMessage {
+                        Text("Diagnostics degraded: \(diagnostics)")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
                 Spacer()
                 if model.registrationMessage.contains("approval") {
@@ -264,7 +363,7 @@ private struct DashboardView: View {
                 } else if model.preflight?.findings.contains(where: { $0.id == "legacy-agent" }) == true {
                     Button("Migrate Legacy Watcher") { model.migrateLegacy() }
                 } else if model.status == nil {
-                    Button("Register Again") { model.registerAgent() }
+                    Button("Replace Agent Registration") { model.registerAgent() }
                 }
             }
             .padding(.vertical, 4)
@@ -281,6 +380,15 @@ private struct DashboardView: View {
                 )
                 .foregroundStyle(.secondary)
                 HStack {
+                    Button(
+                        model.status?.incidentMode == true ? "Exit Incident Mode" : "Enter Incident Mode"
+                    ) {
+                        if model.status?.incidentMode == true {
+                            model.exitIncidentMode()
+                        } else {
+                            model.enterIncidentMode()
+                        }
+                    }
                     Button("Retry Restore") { model.retryRestore() }
                         .buttonStyle(.borderedProminent)
                         .disabled(model.status?.journal == nil || model.operationInProgress)
@@ -298,14 +406,31 @@ private struct DashboardView: View {
     }
 
     private var controls: some View {
-        GroupBox("Roblox / Phantom Forces") {
-            HStack {
-                Button("Run Preflight") { model.runPreflight() }
-                Button("Enter / Re-enforce") { model.enter() }
-                Button("Restore") { model.restore() }
-                    .disabled(model.status?.journal == nil)
-                Spacer()
-                Button(model.status?.phase == .paused ? "Resume" : "Pause") { model.togglePause() }
+        GroupBox(model.status?.activeProfile?.name ?? "Game profile") {
+            VStack(alignment: .leading, spacing: 10) {
+                Picker(
+                    "Active profile",
+                    selection: Binding(
+                        get: { model.status?.activeProfile?.identifier ?? "" },
+                        set: { model.selectProfile($0) }
+                    )
+                ) {
+                    ForEach(model.profiles) { profile in
+                        Text(profile.name).tag(profile.identifier)
+                    }
+                }
+                .disabled(model.status?.journal != nil || model.operationInProgress)
+                HStack {
+                    Button("Run Preflight") { model.runPreflight() }
+                    Button("Safe Launch") { model.safeLaunch() }
+                        .disabled(model.status?.trigger.state != .stopped || model.status?.journal != nil)
+                    Button("Enter / Re-enforce") { model.enter() }
+                    Button("Restore") { model.restore() }
+                        .disabled(model.status?.journal == nil)
+                    Spacer()
+                    Button(model.status?.phase == .paused ? "Resume" : "Pause") { model.togglePause() }
+                        .disabled(model.status?.incidentMode == true)
+                }
             }
             .disabled(model.operationInProgress)
             .padding(.vertical, 4)
@@ -317,6 +442,27 @@ private struct DashboardView: View {
         GroupBox("Competitive preflight") {
             if let report = model.preflight {
                 VStack(alignment: .leading, spacing: 10) {
+                    ForEach(report.probes ?? []) { probe in
+                        HStack {
+                            Image(
+                                systemName: probe.state == .succeeded
+                                    ? "checkmark.circle.fill" : "questionmark.circle.fill"
+                            )
+                            .foregroundStyle(probe.state == .succeeded ? .green : .orange)
+                            Text(probe.name).font(.callout.weight(.medium))
+                            Spacer()
+                            Text(
+                                "last success: \(probe.age(at: Date()).map { "\(Int($0))s ago" } ?? "never")"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    if !report.isFreshAndComplete() {
+                        Text("Readiness is blocked until every probe succeeds within 120 seconds.")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.orange)
+                    }
                     ForEach(report.findings) { finding in
                         HStack(alignment: .top, spacing: 10) {
                             Image(systemName: severityIcon(finding.severity))
@@ -403,6 +549,62 @@ private struct DashboardView: View {
         }
     }
 
+    private var recoveryHistoryCard: some View {
+        GroupBox("Resolved recovery history") {
+            if model.recoveryHistory.isEmpty {
+                Text("No historical recovery receipts yet.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(model.recoveryHistory) { receipt in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(
+                                "Historical receipt · \(receipt.restoredAt.formatted(date: .abbreviated, time: .standard))"
+                            )
+                            .font(.callout.weight(.medium))
+                            Text(
+                                "\(receipt.results.count) target postconditions verified; this is not active recovery state."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    private var performanceTimelineCard: some View {
+        GroupBox("Session performance") {
+            if model.performanceTimeline.isEmpty {
+                Text("No system performance records yet.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(model.performanceTimeline.prefix(10)) { record in
+                        HStack {
+                            Text(record.operation).font(.callout.weight(.medium))
+                            Spacer()
+                            Text(
+                                "\(record.durationMilliseconds) ms · \(record.thermalState) · \(record.failureCount) failures"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text("System metadata only; gameplay content is never recorded.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
     private var diagnosticsCard: some View {
         GroupBox("Diagnostics") {
             HStack {
@@ -415,8 +617,12 @@ private struct DashboardView: View {
                 Spacer()
                 Button("Copy JSON") { model.copyDiagnostics() }
                 Button("Export…") { model.exportDiagnostics() }
+                Button("Support Bundle…") { model.exportSupportBundle() }
             }
-            .padding(.vertical, 4)
+            Text("Support bundles are redacted, saved locally, and never submitted automatically.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 4)
         }
     }
 
@@ -476,6 +682,62 @@ private struct DashboardView: View {
                 }
                 .padding(.vertical, 4)
             }
+        }
+    }
+
+    private var profileEditorCard: some View {
+        let draft = model.profileDraft
+        let validation = draft.validationReport()
+        return GroupBox("Validated profile editor") {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Profile name", text: $model.profileDraftName)
+                TextField("Game trigger bundle ID", text: $model.profileDraftTriggerBundleIdentifier)
+                Text("Exact automatic mutation preview")
+                    .font(.callout.weight(.semibold))
+                ForEach(validation.mutations) { mutation in
+                    LabeledContent(mutation.action, value: mutation.target)
+                        .font(.caption)
+                }
+                if !validation.errors.isEmpty {
+                    ForEach(validation.errors, id: \.self) { error in
+                        Text(error).font(.caption).foregroundStyle(.red)
+                    }
+                }
+                HStack {
+                    Button("Validate") { model.validateProfileDraft() }
+                    Button("Save Custom Profile") { model.saveProfileDraft() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!validation.isValid || model.status?.journal != nil)
+                    Button("Import…") { model.importProfile() }
+                    Button("Export Active…") { model.exportActiveProfile() }
+                    Spacer()
+                    Text("\(validation.mutations.count) bounded targets")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let preview = model.profileImportPreview {
+                    Divider()
+                    Text("Import mutation diff")
+                        .font(.callout.weight(.semibold))
+                    ForEach(preview.addedMutations) { mutation in
+                        Text("+ \(mutation.action) · \(mutation.target)")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                    ForEach(preview.removedMutations) { mutation in
+                        Text("− \(mutation.action) · \(mutation.target)")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    ForEach(preview.validation.errors, id: \.self) { error in
+                        Text(error).font(.caption).foregroundStyle(.red)
+                    }
+                    Button("Confirm Import") { model.confirmProfileImport() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!preview.canImport || model.status?.journal != nil)
+                }
+            }
+            .padding(.vertical, 4)
         }
     }
 
@@ -617,12 +879,70 @@ private struct CleanroomSettingsView: View {
                 Text("Cleanroom never posts a competitive-mode activation banner during gameplay.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle(
+                    "Alert on in-session thermal or battery threshold crossings",
+                    isOn: Binding(
+                        get: { model.performanceAlertsEnabled },
+                        set: { model.setPerformanceAlertsEnabled($0) }
+                    )
+                )
+                Picker("Thermal threshold", selection: $model.thermalAlertThreshold) {
+                    Text("Serious").tag(ThermalPressureLevel.serious)
+                    Text("Critical").tag(ThermalPressureLevel.critical)
+                }
+                Stepper(
+                    "Battery threshold: \(model.batteryAlertThreshold)%",
+                    value: $model.batteryAlertThreshold,
+                    in: 5...50,
+                    step: 5
+                )
+                Button("Save Alert Thresholds") { model.savePerformanceAlertThresholds() }
+            }
+
+            Section("Global hotkeys") {
+                Text("Control-Option-Command + S status · P preflight · L safe launch · C pause/resume · R restore")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Hotkeys and App Shortcuts call the same authenticated agent commands as the UI.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Device calibration") {
+                Text("Hardware \(model.calibrationHardwareIdentifier)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Use linear pointer input during sessions", isOn: $model.calibrationPointerLinearEnabled)
+                Stepper(
+                    "Expected display: \(model.calibrationDisplayRefreshRateHertz) Hz",
+                    value: $model.calibrationDisplayRefreshRateHertz,
+                    in: 30...360,
+                    step: 10
+                )
+                Stepper(
+                    "Exit debounce: \(model.calibrationRestoreDebounceSeconds.formatted()) s",
+                    value: $model.calibrationRestoreDebounceSeconds,
+                    in: 0...30,
+                    step: 0.5
+                )
+                Button("Save for This Mac") { model.saveCalibration() }
+                    .disabled(model.calibrationHardwareIdentifier == "unknown")
             }
 
             Section("Build") {
                 LabeledContent("Version", value: model.appVersion)
                 LabeledContent("Profile", value: "Roblox / Phantom Forces")
                 LabeledContent("Network control", value: "Read-only observations")
+                Picker(
+                    "Update channel",
+                    selection: Binding(
+                        get: { model.updateChannel },
+                        set: { model.setUpdateChannel($0) }
+                    )
+                ) {
+                    Text("Stable").tag(CleanroomUpdateChannel.stable)
+                    Text("Beta").tag(CleanroomUpdateChannel.beta)
+                }
             }
         }
         .formStyle(.grouped)

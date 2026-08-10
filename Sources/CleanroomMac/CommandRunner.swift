@@ -153,6 +153,7 @@ private final class ProcessCompletionGate: @unchecked Sendable {
     private var continuation: CheckedContinuation<ProcessCompletion, Never>?
     private var timeoutTask: Task<Void, Never>?
     private var process: Process?
+    private var timeoutTriggered = false
 
     init(_ continuation: CheckedContinuation<ProcessCompletion, Never>) {
         self.continuation = continuation
@@ -162,31 +163,45 @@ private final class ProcessCompletionGate: @unchecked Sendable {
         lock.lock()
         let taken = continuation
         continuation = nil
+        let resolvedTimedOut = timedOut || timeoutTriggered
         timeoutTask?.cancel()
         timeoutTask = nil
+        process = nil
         lock.unlock()
-        taken?.resume(returning: ProcessCompletion(timedOut: timedOut, launchError: launchError))
+        taken?.resume(returning: ProcessCompletion(timedOut: resolvedTimedOut, launchError: launchError))
     }
 
     func armTimeout(after seconds: TimeInterval, process: Process) {
-        lock.lock()
-        self.process = process
-        lock.unlock()
         let task = Task { [self] in
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
-            if let process = self.process, process.isRunning {
+            guard let process = beginTimeout() else { return }
+            if process.isRunning {
                 process.terminate()
                 Darwin.usleep(200_000)
                 if process.isRunning {
                     Darwin.kill(process.processIdentifier, SIGKILL)
                 }
             }
-            self.process?.waitUntilExit()
+            process.waitUntilExit()
             finish(timedOut: true)
         }
         lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        self.process = process
         timeoutTask = task
         lock.unlock()
+    }
+
+    private func beginTimeout() -> Process? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard continuation != nil else { return nil }
+        timeoutTriggered = true
+        return process
     }
 }

@@ -8,18 +8,64 @@ public let cleanroomAgentMachServiceName = "com.rex.cleanroom.agent"
 
 public actor CleanroomAgentClient {
     private var connection: NSXPCConnection?
+    private var negotiatedCapabilities: Set<AgentCapability> = []
 
     public init() {}
 
-    public func send(_ command: AgentCommand) async throws -> AgentResponse {
-        let request = AgentRequest(command: command)
+    public func send(
+        _ command: AgentCommand,
+        destructiveRecoveryConfirmed: Bool = false
+    ) async throws -> AgentResponse {
+        let request = AgentRequest(
+            command: command,
+            destructiveRecoveryConfirmed: destructiveRecoveryConfirmed
+        )
+        do {
+            return try await send(request)
+        } catch AgentProtocolError.timedOut {
+            invalidate()
+            return try await send(request)
+        }
+    }
+
+    /// Retrying an explicit request preserves its identity, allowing the
+    /// agent to return in-progress or cached completion state without running
+    /// the command twice.
+    public func send(_ request: AgentRequest) async throws -> AgentResponse {
+        if let required = request.command.requiredCapability {
+            try await ensureCapability(required)
+        }
+        return try await sendWithoutNegotiation(request)
+    }
+
+    private func ensureCapability(_ required: AgentCapability) async throws {
+        if negotiatedCapabilities.contains(required) { return }
+        let request = AgentRequest(
+            command: .handshake(AgentHandshakeRequest(requiredCapabilities: [required]))
+        )
+        let response: AgentResponse
+        do {
+            response = try await sendWithoutNegotiation(request)
+        } catch {
+            throw AgentProtocolError.incompatible(
+                "Capability handshake failed before \(required.rawValue): \(error.localizedDescription)"
+            )
+        }
+        guard case .handshake(let handshake) = response.payload else {
+            throw AgentProtocolError.incompatible("The agent did not return a capability handshake.")
+        }
+        try handshake.validate(required: required)
+        negotiatedCapabilities = Set(handshake.capabilities)
+    }
+
+    private func sendWithoutNegotiation(_ request: AgentRequest) async throws -> AgentResponse {
         let requestData = try AgentCodec.encode(request)
         let connection = activeConnection()
 
         do {
             let responseData: Data = try await withCheckedThrowingContinuation { continuation in
                 let gate = ContinuationGate(continuation)
-                gate.armTimeout(after: Self.timeout(for: command))
+                gate.armTimeout(after: Self.timeout(for: request.command))
                 guard
                     let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
                         gate.fail(error)
@@ -57,9 +103,18 @@ public actor CleanroomAgentClient {
     /// preflight, termination grace periods, and restore verification.
     private static func timeout(for command: AgentCommand) -> TimeInterval {
         switch command {
-        case .enter, .restore, .preflight, .recover, .migrateLegacy:
+        case .enter, .restore, .safeLaunch, .preflight, .recover, .migrateLegacy:
             60
-        case .status, .reconcile, .setPaused, .recentEvents:
+        case .handshake, .status, .reconcile, .setPaused, .setIncidentMode, .recentEvents,
+            .performanceTimeline, .recoveryReceipts, .profiles, .selectProfile, .networkLatency:
+            15
+        case .systemPressure:
+            15
+        case .validateProfile, .saveProfile:
+            30
+        case .deviceCalibration, .saveDeviceCalibration:
+            15
+        case .exportProfile, .previewProfileImport:
             15
         }
     }
@@ -67,6 +122,7 @@ public actor CleanroomAgentClient {
     public func invalidate() {
         connection?.invalidate()
         connection = nil
+        negotiatedCapabilities = []
     }
 
     private func activeConnection() -> NSXPCConnection {

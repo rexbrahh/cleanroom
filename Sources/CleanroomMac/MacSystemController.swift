@@ -8,6 +8,7 @@ public actor MacSystemController: CleanroomSystemControlling {
     private let applications: any ApplicationManaging
     private let preferences: any PreferenceReading
     private let userIdentifier: uid_t
+    private var preflightSuccesses: [String: Date] = [:]
 
     public init(
         commands: any CommandRunning,
@@ -30,7 +31,11 @@ public actor MacSystemController: CleanroomSystemControlling {
     }
 
     public func probeTrigger() async -> TriggerProbe {
-        let probe = await applications.probe(bundleIdentifier: CleanroomProfile.robloxBundleIdentifier)
+        await probeTrigger(bundleIdentifier: CleanroomProfile.robloxBundleIdentifier)
+    }
+
+    public func probeTrigger(bundleIdentifier: String) async -> TriggerProbe {
+        let probe = await applications.probe(bundleIdentifier: bundleIdentifier)
         switch probe.state {
         case .running:
             guard let processIdentifier = probe.processIdentifier else {
@@ -40,7 +45,7 @@ public actor MacSystemController: CleanroomSystemControlling {
                 state: .running,
                 process: TriggerProcess(
                     processIdentifier: processIdentifier,
-                    bundleIdentifier: CleanroomProfile.robloxBundleIdentifier,
+                    bundleIdentifier: bundleIdentifier,
                     executableURL: probe.executableURL
                 )
             )
@@ -51,11 +56,17 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
     }
 
+    public func launchTrigger(bundleIdentifier: String) async -> ActionResult {
+        await applications.start(bundleIdentifier: bundleIdentifier, displayName: "Roblox")
+    }
+
     public func captureSnapshot(for profile: CleanroomProfile) async throws -> SystemSnapshot {
         var serviceLabels: [String] = []
         var bundleIdentifiers: [String] = []
         var processNames: [String] = []
         var preferences: [StoredPreference] = []
+        var applicationStates: [StoredApplication] = []
+        var processStates: [StoredProcess] = []
 
         for service in profile.services {
             switch await probeService(label: service.label) {
@@ -69,7 +80,16 @@ public actor MacSystemController: CleanroomSystemControlling {
         for application in profile.applications {
             let probe = await applications.probe(bundleIdentifier: application.bundleIdentifier)
             switch probe.state {
-            case .running: bundleIdentifiers.append(application.bundleIdentifier)
+            case .running:
+                bundleIdentifiers.append(application.bundleIdentifier)
+                applicationStates.append(
+                    StoredApplication(
+                        bundleIdentifier: application.bundleIdentifier,
+                        processIdentifiers: probe.instances.map(\.processIdentifier),
+                        bundleURLs: probe.instances.compactMap(\.bundleURL),
+                        executableURLs: probe.instances.compactMap(\.executableURL)
+                    )
+                )
             case .stopped: break
             case .unknown:
                 throw CleanroomError.mutationFailed("Could not inspect \(application.name).")
@@ -77,8 +97,17 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
 
         for process in profile.processes {
-            switch await probeProcess(executableName: process.executableName) {
-            case .running: processNames.append(process.executableName)
+            let probe = await probeProcessIdentity(executableName: process.executableName)
+            switch probe.state {
+            case .running:
+                processNames.append(process.executableName)
+                processStates.append(
+                    StoredProcess(
+                        executableName: process.executableName,
+                        processIdentifiers: probe.processIdentifiers,
+                        executableURLs: probe.executableURLs
+                    )
+                )
             case .stopped: break
             case .unknown:
                 throw CleanroomError.mutationFailed("Could not inspect process \(process.executableName).")
@@ -93,12 +122,15 @@ public actor MacSystemController: CleanroomSystemControlling {
             activeServiceLabels: serviceLabels,
             activeApplicationBundleIdentifiers: bundleIdentifiers,
             activeProcessNames: processNames,
-            preferences: preferences
+            preferences: preferences,
+            applications: applicationStates,
+            processes: processStates
         )
     }
 
     public func apply(profile: CleanroomProfile) async -> [ActionResult] {
-        if await probeService(label: Self.legacyAgentLabel) == .running {
+        switch await probeService(label: Self.legacyAgentLabel) {
+        case .running:
             return [
                 ActionResult(
                     action: "safety check",
@@ -107,6 +139,17 @@ public actor MacSystemController: CleanroomSystemControlling {
                     detail: "The legacy watcher is loaded. Run the guided migration before entering Cleanroom."
                 )
             ]
+        case .unknown:
+            return [
+                ActionResult(
+                    action: "safety check",
+                    target: Self.legacyAgentLabel,
+                    outcome: .unknown,
+                    detail: "Legacy watcher ownership could not be determined; no Cleanroom mutation was attempted."
+                )
+            ]
+        case .stopped:
+            break
         }
 
         var results: [ActionResult] = []
@@ -120,26 +163,74 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
         results.append(contentsOf: await synchronizeProcesses(Set(changedSyncProcesses)))
 
-        let componentResults = await withTaskGroup(of: ActionResult.self) { group in
-            for service in profile.services {
-                group.addTask { await self.stopService(service) }
+        let policyResults =
+            profile.services.compactMap { service in
+                profile.policy(for: service.label).disposition == .leaveRunning
+                    ? ActionResult(
+                        action: "leave service",
+                        target: service.name,
+                        outcome: .skipped,
+                        detail: "Profile policy leaves this service unchanged."
+                    ) : nil
             }
-            for application in profile.applications {
+            + profile.applications.compactMap { application in
+                profile.policy(for: application.bundleIdentifier).disposition == .leaveRunning
+                    ? ActionResult(
+                        action: "leave application",
+                        target: application.name,
+                        outcome: .skipped,
+                        detail: "Profile policy leaves this application unchanged."
+                    ) : nil
+            }
+            + profile.processes.compactMap { process in
+                profile.policy(for: process.executableName).disposition == .leaveRunning
+                    ? ActionResult(
+                        action: "leave process",
+                        target: process.name,
+                        outcome: .skipped,
+                        detail: "Profile policy leaves this process unchanged."
+                    ) : nil
+            }
+        let componentResults = await withTaskGroup(of: ActionResult.self) { group in
+            for service in profile.services
+            where profile.policy(for: service.label).disposition == .stop {
                 group.addTask {
-                    await self.applications.stop(
-                        bundleIdentifier: application.bundleIdentifier,
-                        displayName: application.name
+                    await self.applyFailurePolicy(
+                        to: await self.stopService(service),
+                        targetIdentifier: service.label,
+                        profile: profile
                     )
                 }
             }
-            for process in profile.processes {
-                group.addTask { await self.stopProcess(process) }
+            for application in profile.applications
+            where profile.policy(for: application.bundleIdentifier).disposition == .stop {
+                group.addTask {
+                    await self.applyFailurePolicy(
+                        to: await self.applications.stop(
+                            bundleIdentifier: application.bundleIdentifier,
+                            displayName: application.name
+                        ),
+                        targetIdentifier: application.bundleIdentifier,
+                        profile: profile
+                    )
+                }
+            }
+            for process in profile.processes
+            where profile.policy(for: process.executableName).disposition == .stop {
+                group.addTask {
+                    await self.applyFailurePolicy(
+                        to: await self.stopProcess(process),
+                        targetIdentifier: process.executableName,
+                        profile: profile
+                    )
+                }
             }
 
             var collected: [ActionResult] = []
             for await result in group { collected.append(result) }
             return collected
         }
+        results.append(contentsOf: policyResults)
         results.append(contentsOf: componentResults.sorted(by: resultSort))
         return results
     }
@@ -147,7 +238,8 @@ public actor MacSystemController: CleanroomSystemControlling {
     public func verifyApplied(profile: CleanroomProfile) async -> [ActionResult] {
         var results: [ActionResult] = []
 
-        if await probeService(label: Self.legacyAgentLabel) == .running {
+        switch await probeService(label: Self.legacyAgentLabel) {
+        case .running:
             results.append(
                 ActionResult(
                     action: "verify legacy watcher",
@@ -155,36 +247,91 @@ public actor MacSystemController: CleanroomSystemControlling {
                     outcome: .failed,
                     detail: "Legacy watcher remains loaded."
                 ))
+        case .unknown:
+            results.append(
+                ActionResult(
+                    action: "verify legacy watcher",
+                    target: Self.legacyAgentLabel,
+                    outcome: .unknown,
+                    detail: "Legacy watcher ownership could not be determined."
+                ))
+        case .stopped:
+            break
         }
 
         for preference in profile.preferences {
             results.append(await verifyPreference(preference))
         }
         for service in profile.services {
+            if profile.policy(for: service.label).disposition == .leaveRunning {
+                results.append(
+                    ActionResult(
+                        action: "verify service policy",
+                        target: service.name,
+                        outcome: .skipped,
+                        detail: "Left unchanged by profile policy."
+                    )
+                )
+                continue
+            }
             results.append(
-                probeResult(
-                    action: "verify service stopped",
-                    target: service.name,
-                    actual: await probeService(label: service.label),
-                    expected: .stopped
+                applyFailurePolicy(
+                    to: probeResult(
+                        action: "verify service stopped",
+                        target: service.name,
+                        actual: await probeService(label: service.label),
+                        expected: .stopped
+                    ),
+                    targetIdentifier: service.label,
+                    profile: profile
                 ))
         }
         for application in profile.applications {
+            if profile.policy(for: application.bundleIdentifier).disposition == .leaveRunning {
+                results.append(
+                    ActionResult(
+                        action: "verify application policy",
+                        target: application.name,
+                        outcome: .skipped,
+                        detail: "Left unchanged by profile policy."
+                    )
+                )
+                continue
+            }
             results.append(
-                probeResult(
-                    action: "verify application stopped",
-                    target: application.name,
-                    actual: await applications.probe(bundleIdentifier: application.bundleIdentifier).state,
-                    expected: .stopped
+                applyFailurePolicy(
+                    to: probeResult(
+                        action: "verify application stopped",
+                        target: application.name,
+                        actual: await applications.probe(bundleIdentifier: application.bundleIdentifier).state,
+                        expected: .stopped
+                    ),
+                    targetIdentifier: application.bundleIdentifier,
+                    profile: profile
                 ))
         }
         for process in profile.processes {
+            if profile.policy(for: process.executableName).disposition == .leaveRunning {
+                results.append(
+                    ActionResult(
+                        action: "verify process policy",
+                        target: process.name,
+                        outcome: .skipped,
+                        detail: "Left unchanged by profile policy."
+                    )
+                )
+                continue
+            }
             results.append(
-                probeResult(
-                    action: "verify process stopped",
-                    target: process.name,
-                    actual: await probeProcess(executableName: process.executableName),
-                    expected: .stopped
+                applyFailurePolicy(
+                    to: probeResult(
+                        action: "verify process stopped",
+                        target: process.name,
+                        actual: await probeProcess(executableName: process.executableName),
+                        expected: .stopped
+                    ),
+                    targetIdentifier: process.executableName,
+                    profile: profile
                 ))
         }
         return results
@@ -221,38 +368,83 @@ public actor MacSystemController: CleanroomSystemControlling {
             try? await Task.sleep(for: .milliseconds(1500))
         }
 
-        let componentResults = await withTaskGroup(of: ActionResult.self) { group in
-            for label in snapshot.activeServiceLabels {
-                guard let service = profile.services.first(where: { $0.label == label }) else { continue }
-                group.addTask { await self.restoreService(service) }
-            }
-            for bundleIdentifier in snapshot.activeApplicationBundleIdentifiers {
-                guard
-                    let application = profile.applications.first(where: {
-                        $0.bundleIdentifier == bundleIdentifier && $0.restoreWhenPreviouslyRunning
-                    })
-                else { continue }
-                group.addTask {
-                    await self.applications.start(
-                        bundleIdentifier: application.bundleIdentifier,
-                        displayName: application.name
-                    )
-                }
-            }
-            for executableName in snapshot.activeProcessNames {
-                guard
-                    let process = profile.processes.first(where: {
-                        $0.executableName == executableName
-                    })
-                else { continue }
-                group.addTask { await self.restoreProcess(process) }
-            }
-
-            var collected: [ActionResult] = []
-            for await result in group { collected.append(result) }
-            return collected
+        var components: [RestoreComponent] = []
+        for label in snapshot.activeServiceLabels {
+            guard let service = profile.services.first(where: { $0.label == label }) else { continue }
+            components.append(.service(service))
         }
-        results.append(contentsOf: componentResults.sorted(by: resultSort))
+        for bundleIdentifier in snapshot.activeApplicationBundleIdentifiers {
+            guard
+                let application = profile.applications.first(where: {
+                    $0.bundleIdentifier == bundleIdentifier && $0.restoreWhenPreviouslyRunning
+                })
+            else { continue }
+            let savedState =
+                snapshot.applications.first(where: {
+                    $0.bundleIdentifier == application.bundleIdentifier
+                })
+                ?? StoredApplication(
+                    bundleIdentifier: application.bundleIdentifier,
+                    processIdentifiers: [],
+                    bundleURLs: [],
+                    executableURLs: []
+                )
+            components.append(.application(application, savedState))
+        }
+        for executableName in snapshot.activeProcessNames {
+            guard let process = profile.processes.first(where: { $0.executableName == executableName }) else {
+                continue
+            }
+            let savedState =
+                snapshot.processes.first(where: { $0.executableName == executableName })
+                ?? StoredProcess(executableName: executableName, processIdentifiers: [])
+            components.append(.process(process, savedState))
+        }
+        components.sort {
+            let left = profile.policy(for: $0.identifier)
+            let right = profile.policy(for: $1.identifier)
+            return left.restoreOrder == right.restoreOrder
+                ? $0.identifier < $1.identifier : left.restoreOrder < right.restoreOrder
+        }
+        for component in components {
+            let policy = profile.policy(for: component.identifier)
+            guard policy.disposition == .stop else {
+                results.append(
+                    ActionResult(
+                        action: "restore policy",
+                        target: component.displayName,
+                        outcome: .skipped,
+                        detail: "Target was left unchanged, so no restoration was needed."
+                    )
+                )
+                continue
+            }
+            if policy.restoreDelayMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(policy.restoreDelayMilliseconds))
+            }
+            let result: ActionResult
+            switch component {
+            case .service(let service):
+                result = await restoreService(service)
+            case .application(let application, let savedState):
+                result = await applications.start(
+                    bundleIdentifier: application.bundleIdentifier,
+                    displayName: application.name,
+                    savedState: savedState
+                )
+            case .process(let process, let savedState):
+                result = await restoreProcess(process, savedState: savedState)
+            }
+            results.append(
+                applyFailurePolicy(
+                    to: result,
+                    targetIdentifier: component.identifier,
+                    profile: profile
+                )
+            )
+        }
+
+        results.append(contentsOf: await verifyRestoredComponents(snapshot: snapshot, profile: profile))
 
         var verification: [(stored: StoredPreference, result: ActionResult)] = []
         for stored in snapshot.preferences {
@@ -275,11 +467,75 @@ public actor MacSystemController: CleanroomSystemControlling {
         return results
     }
 
-    public func preflight(profile: CleanroomProfile) async -> PreflightReport {
-        var findings: [PreflightFinding] = []
+    private func verifyRestoredComponents(
+        snapshot: SystemSnapshot,
+        profile: CleanroomProfile
+    ) async -> [ActionResult] {
+        var results: [ActionResult] = []
+        for label in snapshot.activeServiceLabels.sorted() {
+            guard let service = profile.services.first(where: { $0.label == label }) else { continue }
+            guard profile.policy(for: label).disposition == .stop else { continue }
+            results.append(
+                applyFailurePolicy(
+                    to: probeResult(
+                        action: "verify restored service",
+                        target: service.name,
+                        actual: await probeService(label: label),
+                        expected: .running
+                    ),
+                    targetIdentifier: label,
+                    profile: profile
+                )
+            )
+        }
+        for bundleIdentifier in snapshot.activeApplicationBundleIdentifiers.sorted() {
+            guard
+                let application = profile.applications.first(where: {
+                    $0.bundleIdentifier == bundleIdentifier && $0.restoreWhenPreviouslyRunning
+                })
+            else { continue }
+            guard profile.policy(for: bundleIdentifier).disposition == .stop else { continue }
+            results.append(
+                applyFailurePolicy(
+                    to: probeResult(
+                        action: "verify restored application",
+                        target: application.name,
+                        actual: await applications.probe(bundleIdentifier: bundleIdentifier).state,
+                        expected: .running
+                    ),
+                    targetIdentifier: bundleIdentifier,
+                    profile: profile
+                )
+            )
+        }
+        for executableName in snapshot.activeProcessNames.sorted() {
+            guard let process = profile.processes.first(where: { $0.executableName == executableName }) else {
+                continue
+            }
+            guard profile.policy(for: executableName).disposition == .stop else { continue }
+            results.append(
+                applyFailurePolicy(
+                    to: probeResult(
+                        action: "verify restored process",
+                        target: process.name,
+                        actual: await probeProcess(executableName: executableName),
+                        expected: .running
+                    ),
+                    targetIdentifier: executableName,
+                    profile: profile
+                )
+            )
+        }
+        return results.sorted(by: resultSort)
+    }
 
-        if await probeService(label: Self.legacyAgentLabel) == .running {
-            findings.append(
+    public func preflight(profile: CleanroomProfile) async -> PreflightReport {
+        let checkedAt = Date()
+        var ownership: [PreflightFinding] = []
+
+        switch await probeService(label: Self.legacyAgentLabel) {
+        case .running:
+            ownership.append(
                 PreflightFinding(
                     id: "legacy-agent",
                     severity: .critical,
@@ -288,11 +544,25 @@ public actor MacSystemController: CleanroomSystemControlling {
                     detail: "Two state owners could overwrite each other's recovery data.",
                     remediation: "Run cleanroomctl migrate-legacy while Roblox is closed."
                 ))
+        case .unknown:
+            ownership.append(
+                PreflightFinding(
+                    id: "legacy-agent-unknown",
+                    severity: .critical,
+                    category: "Ownership",
+                    summary: "Legacy watcher ownership is unknown",
+                    detail: "Cleanroom cannot prove that it is the only state owner.",
+                    remediation: "Repair launchctl access, then run preflight again before entering Cleanroom."
+                ))
+        case .stopped:
+            break
         }
 
+        var managedApplications: [PreflightFinding] = []
         for application in profile.applications {
-            if await applications.probe(bundleIdentifier: application.bundleIdentifier).state == .running {
-                findings.append(
+            switch await applications.probe(bundleIdentifier: application.bundleIdentifier).state {
+            case .running:
+                managedApplications.append(
                     PreflightFinding(
                         id: "managed-app-\(application.bundleIdentifier)",
                         severity: .information,
@@ -300,16 +570,41 @@ public actor MacSystemController: CleanroomSystemControlling {
                         summary: "\(application.name) is active",
                         detail: "Cleanroom will stop it for the session and restore it afterward."
                     ))
+            case .unknown:
+                managedApplications.append(
+                    PreflightFinding(
+                        id: "managed-app-unknown-\(application.bundleIdentifier)",
+                        severity: .warning,
+                        category: "Managed app",
+                        summary: "\(application.name) state is unknown",
+                        detail: "Cleanroom could not complete this managed-application probe.",
+                        remediation: "Re-run preflight before competitive play."
+                    ))
+            case .stopped:
+                break
             }
         }
 
-        findings.append(contentsOf: await processLoadFindings(profile: profile))
-        findings.append(contentsOf: await timeMachineFindings())
-        findings.append(contentsOf: await inputFindings())
-        findings.append(contentsOf: await networkFindings())
-        findings.append(contentsOf: await powerAndThermalFindings())
+        let groups: [(String, String, [PreflightFinding])] = [
+            ("ownership", "State ownership", ownership),
+            ("managed-applications", "Managed applications", managedApplications),
+            ("process-load", "Process load", await processLoadFindings(profile: profile)),
+            ("time-machine", "Time Machine", await timeMachineFindings()),
+            ("input", "Input devices and hooks", await inputFindings()),
+            ("network", "Network path", await networkFindings()),
+            ("power-thermal", "Power and thermal state", await powerAndThermalFindings()),
+        ]
+        var findings = groups.flatMap(\.2)
+        let probes = groups.map { id, name, groupFindings in
+            preflightProbeEvidence(
+                id: id,
+                name: name,
+                findings: groupFindings,
+                checkedAt: checkedAt
+            )
+        }
 
-        if findings.isEmpty {
+        if findings.isEmpty, probes.allSatisfy({ $0.state == .succeeded }) {
             findings.append(
                 PreflightFinding(
                     id: "ready",
@@ -319,7 +614,106 @@ public actor MacSystemController: CleanroomSystemControlling {
                     detail: "The automated checks found no active interference."
                 ))
         }
-        return PreflightReport(findings: findings)
+        return PreflightReport(generatedAt: checkedAt, findings: findings, probes: probes)
+    }
+
+    private func preflightProbeEvidence(
+        id: String,
+        name: String,
+        findings: [PreflightFinding],
+        checkedAt: Date
+    ) -> PreflightProbeEvidence {
+        let incomplete = findings.contains { $0.id.contains("unknown") }
+        if !incomplete { preflightSuccesses[id] = checkedAt }
+        return PreflightProbeEvidence(
+            id: id,
+            name: name,
+            state: incomplete ? .incomplete : .succeeded,
+            checkedAt: checkedAt,
+            lastSucceededAt: preflightSuccesses[id]
+        )
+    }
+
+    public func sampleNetworkLatency(sampleCount requestedCount: Int) async -> NetworkLatencyReport {
+        let sampleCount = min(max(requestedCount, 1), 20)
+        let routeArguments = ["-n", "get", "default"]
+        let route = await commands.run("/sbin/route", arguments: routeArguments, timeout: 4)
+        var observations = [CommandObservation(executable: "/sbin/route", arguments: routeArguments)]
+        guard route.succeeded,
+            let gateway = route.standardOutput.split(separator: "\n").compactMap({ line -> String? in
+                let fields = line.split(whereSeparator: \.isWhitespace)
+                guard fields.first == "gateway:", fields.count == 2 else { return nil }
+                return String(fields[1])
+            }).first,
+            gateway.range(of: #"^[0-9a-fA-F:.%]+$"#, options: .regularExpression) != nil
+        else {
+            return NetworkLatencyReport(
+                target: nil,
+                sampleCount: 0,
+                averageMilliseconds: nil,
+                jitterMilliseconds: nil,
+                packetLossPercent: nil,
+                error: route.succeeded ? "The active default gateway could not be parsed." : commandFailure(route),
+                commands: observations
+            )
+        }
+
+        let pingArguments = ["-n", "-q", "-c", String(sampleCount), "-W", "1000", gateway]
+        observations.append(CommandObservation(executable: "/sbin/ping", arguments: pingArguments))
+        let ping = await commands.run(
+            "/sbin/ping", arguments: pingArguments, timeout: TimeInterval(sampleCount + 3))
+        let loss = Self.packetLoss(from: ping.standardOutput)
+        let timing = Self.roundTripTiming(from: ping.standardOutput)
+        return NetworkLatencyReport(
+            target: gateway,
+            sampleCount: sampleCount,
+            averageMilliseconds: timing?.average,
+            jitterMilliseconds: timing?.jitter,
+            packetLossPercent: loss,
+            error: ping.succeeded ? nil : commandFailure(ping),
+            commands: observations
+        )
+    }
+
+    public func sampleSystemPressure() async -> SystemPressureSample {
+        let battery = await commands.run("/usr/bin/pmset", arguments: ["-g", "batt"], timeout: 3)
+        let output = battery.succeeded ? battery.standardOutput : ""
+        let percentage = output.range(of: #"[0-9]{1,3}%"#, options: .regularExpression).flatMap {
+            Int(output[$0].dropLast())
+        }
+        let onACPower: Bool? = battery.succeeded ? output.contains("AC Power") : nil
+        let thermal: ThermalPressureLevel
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: thermal = .nominal
+        case .fair: thermal = .fair
+        case .serious: thermal = .serious
+        case .critical: thermal = .critical
+        @unknown default: thermal = .unknown
+        }
+        return SystemPressureSample(
+            thermal: thermal,
+            batteryPercent: percentage,
+            onACPower: onACPower
+        )
+    }
+
+    private static func packetLoss(from output: String) -> Double? {
+        for component in output.split(separator: ",") where component.contains("packet loss") {
+            guard let token = component.split(whereSeparator: \.isWhitespace).first(where: { $0.contains("%") })
+            else { continue }
+            return Double(token.replacingOccurrences(of: "%", with: ""))
+        }
+        return nil
+    }
+
+    private static func roundTripTiming(from output: String) -> (average: Double, jitter: Double)? {
+        guard let line = output.split(separator: "\n").first(where: { $0.contains("min/avg/max") }),
+            let values = line.split(separator: "=").last?.split(separator: "/"),
+            values.count >= 4,
+            let average = Double(values[1].trimmingCharacters(in: .whitespaces)),
+            let jitter = Double(values[3].split(whereSeparator: \.isWhitespace).first ?? "")
+        else { return nil }
+        return (average, jitter)
     }
 
     public func migrateLegacy() async -> TransitionReport {
@@ -428,13 +822,20 @@ public actor MacSystemController: CleanroomSystemControlling {
             let key = "\($0.domain)\u{0}\($0.key)\u{0}\($0.kind.rawValue)"
             return allowedPreferences.contains(key) ? nil : "\($0.domain):\($0.key)"
         }
+        let storedPreferences = Set(
+            snapshot.preferences.map { "\($0.domain)\u{0}\($0.key)\u{0}\($0.kind.rawValue)" }
+        )
+        invalid += allowedPreferences.subtracting(storedPreferences).sorted().map { key in
+            let fields = key.split(separator: "\u{0}", omittingEmptySubsequences: false)
+            return fields.count >= 2 ? "missing \(fields[0]):\(fields[1])" : "missing preference"
+        }
         guard !invalid.isEmpty else { return [] }
         return [
             ActionResult(
                 action: "validate recovery snapshot",
                 target: "recovery.json",
                 outcome: .failed,
-                detail: "Snapshot contains unmanaged entries: \(invalid.joined(separator: ", "))."
+                detail: "Snapshot is invalid or incomplete: \(invalid.joined(separator: ", "))."
             )
         ]
     }
@@ -468,7 +869,8 @@ public actor MacSystemController: CleanroomSystemControlling {
         -> (result: ActionResult, changed: Bool)
     {
         let target = "\(preference.domain):\(preference.key)"
-        if let current = try? await readPreference(preference),
+        let original = try? await readPreference(preference)
+        if let current = original,
             current.wasPresent,
             valuesMatch(current.value, preference.activeValue, kind: preference.kind)
         {
@@ -486,18 +888,55 @@ public actor MacSystemController: CleanroomSystemControlling {
             "/usr/bin/defaults",
             arguments: [
                 "write", preference.domain, preference.key,
-                defaultsFlag(preference.kind), preference.activeValue,
+                defaultsFlag(preference.kind), defaultsWriteValue(preference.activeValue, kind: preference.kind),
             ],
             timeout: 3
         )
+        guard result.succeeded else {
+            return (
+                ActionResult(
+                    action: "apply preference",
+                    target: target,
+                    outcome: .failed,
+                    detail: commandFailure(result)
+                ),
+                false
+            )
+        }
+        do {
+            let actual = try await readPreference(preference)
+            guard actual.wasPresent,
+                valuesMatch(actual.value, preference.activeValue, kind: preference.kind)
+            else {
+                return (
+                    ActionResult(
+                        action: "apply preference",
+                        target: target,
+                        outcome: .failed,
+                        detail: "Write completed, but readback did not match the target value."
+                    ),
+                    false
+                )
+            }
+        } catch {
+            return (
+                ActionResult(
+                    action: "apply preference",
+                    target: target,
+                    outcome: .unknown,
+                    detail: "Write completed, but readback failed: \(error.localizedDescription)"
+                ),
+                false
+            )
+        }
         return (
             ActionResult(
                 action: "apply preference",
                 target: target,
-                outcome: result.succeeded ? .succeeded : .failed,
-                detail: result.succeeded ? "Set to \(preference.activeValue)." : commandFailure(result)
+                outcome: .succeeded,
+                detail: "Set and verified at \(preference.activeValue)."
             ),
-            true
+            original != nil
         )
     }
 
@@ -512,7 +951,8 @@ public actor MacSystemController: CleanroomSystemControlling {
             kind: stored.kind,
             activeValue: stored.value ?? ""
         )
-        if let current = try? await readPreference(probe),
+        let original = try? await readPreference(probe)
+        if let current = original,
             current.wasPresent == stored.wasPresent,
             !stored.wasPresent || valuesMatch(current.value, stored.value, kind: stored.kind)
         {
@@ -543,16 +983,51 @@ public actor MacSystemController: CleanroomSystemControlling {
                 deletionAlreadySatisfied = !actual.wasPresent
             }
         }
+        guard result.succeeded || deletionAlreadySatisfied else {
+            return (
+                ActionResult(
+                    action: "restore preference",
+                    target: target,
+                    outcome: .failed,
+                    detail: commandFailure(result)
+                ),
+                false
+            )
+        }
+        do {
+            let actual = try await readPreference(probe)
+            guard actual.wasPresent == stored.wasPresent,
+                !stored.wasPresent || valuesMatch(actual.value, stored.value, kind: stored.kind)
+            else {
+                return (
+                    ActionResult(
+                        action: "restore preference",
+                        target: target,
+                        outcome: .failed,
+                        detail: "Restore completed, but readback did not match the recovery journal."
+                    ),
+                    false
+                )
+            }
+        } catch {
+            return (
+                ActionResult(
+                    action: "restore preference",
+                    target: target,
+                    outcome: .unknown,
+                    detail: "Restore completed, but readback failed: \(error.localizedDescription)"
+                ),
+                false
+            )
+        }
         return (
             ActionResult(
                 action: "restore preference",
                 target: target,
-                outcome: result.succeeded || deletionAlreadySatisfied ? .succeeded : .failed,
-                detail: result.succeeded || deletionAlreadySatisfied
-                    ? (stored.wasPresent ? "Restored saved value." : "Restored key absence.")
-                    : commandFailure(result)
+                outcome: .succeeded,
+                detail: stored.wasPresent ? "Restored and verified saved value." : "Restored and verified key absence."
             ),
-            true
+            original != nil
         )
     }
 
@@ -709,34 +1184,77 @@ public actor MacSystemController: CleanroomSystemControlling {
             arguments: ["bootstrap", "gui/\(userIdentifier)", service.propertyListURL.path],
             timeout: 5
         )
-        let postcondition = await waitForService(service.label, expected: .running, timeout: 4)
-        let running = result.succeeded && postcondition
-        return ActionResult(
-            action: "restore service",
-            target: service.name,
-            outcome: running ? .succeeded : .failed,
-            detail: running ? "Reloaded from its saved LaunchAgent." : commandFailure(result)
-        )
+        switch await waitForServiceState(service.label, timeout: 4) {
+        case .running:
+            return ActionResult(
+                action: "restore service",
+                target: service.name,
+                outcome: .succeeded,
+                detail: result.succeeded
+                    ? "Reloaded from its saved LaunchAgent."
+                    : "The service reached its running postcondition despite bootstrap reporting: \(commandFailure(result))"
+            )
+        case .unknown:
+            return ActionResult(
+                action: "restore service",
+                target: service.name,
+                outcome: .unknown,
+                detail: "Service state could not be determined after bootstrap."
+            )
+        case .stopped:
+            return ActionResult(
+                action: "restore service",
+                target: service.name,
+                outcome: .failed,
+                detail: commandFailure(result)
+            )
+        }
     }
 
-    private func waitForService(_ label: String, expected: ProbeState, timeout: TimeInterval) async -> Bool {
+    private func waitForServiceState(_ label: String, timeout: TimeInterval) async -> ProbeState {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if await probeService(label: label) == expected { return true }
+            let state = await probeService(label: label)
+            if state != .stopped { return state }
             try? await Task.sleep(for: .milliseconds(150))
         }
-        return await probeService(label: label) == expected
+        return await probeService(label: label)
+    }
+
+    private func probeProcessIdentity(executableName: String) async -> (
+        state: ProbeState,
+        processIdentifiers: [Int32],
+        executableURLs: [URL]
+    ) {
+        let result = await commands.run(
+            "/usr/bin/pgrep",
+            arguments: ["-U", "\(userIdentifier)", "-x", executableName],
+            timeout: 3
+        )
+        if result.succeeded {
+            let processIdentifiers = result.standardOutput.split(whereSeparator: \.isWhitespace).compactMap {
+                Int32($0)
+            }
+            guard !processIdentifiers.isEmpty else { return (.unknown, [], []) }
+            var executableURLs: [URL] = []
+            for processIdentifier in processIdentifiers {
+                let identity = await commands.run(
+                    "/bin/ps",
+                    arguments: ["-p", "\(processIdentifier)", "-o", "comm="],
+                    timeout: 3
+                )
+                let path = identity.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard identity.succeeded, path.hasPrefix("/") else { return (.unknown, [], []) }
+                executableURLs.append(URL(fileURLWithPath: path))
+            }
+            return (.running, processIdentifiers, executableURLs)
+        }
+        if !result.timedOut, result.launchError == nil, result.exitCode == 1 { return (.stopped, [], []) }
+        return (.unknown, [], [])
     }
 
     private func probeProcess(executableName: String) async -> ProbeState {
-        let result = await commands.run(
-            "/usr/bin/pgrep",
-            arguments: ["-x", executableName],
-            timeout: 3
-        )
-        if result.succeeded { return .running }
-        if !result.timedOut, result.launchError == nil, result.exitCode == 1 { return .stopped }
-        return .unknown
+        await probeProcessIdentity(executableName: executableName).state
     }
 
     private func stopProcess(_ process: ManagedProcess) async -> ActionResult {
@@ -758,7 +1276,7 @@ public actor MacSystemController: CleanroomSystemControlling {
         for attempt in 1...3 {
             _ = await commands.run(
                 "/usr/bin/pkill",
-                arguments: ["-TERM", "-x", process.executableName],
+                arguments: ["-TERM", "-U", "\(userIdentifier)", "-x", process.executableName],
                 timeout: 3
             )
             if await waitUntilProcessStopped(process.executableName, timeout: 1.5) {
@@ -772,7 +1290,7 @@ public actor MacSystemController: CleanroomSystemControlling {
 
             let forced = await commands.run(
                 "/usr/bin/pkill",
-                arguments: ["-KILL", "-x", process.executableName],
+                arguments: ["-KILL", "-U", "\(userIdentifier)", "-x", process.executableName],
                 timeout: 3
             )
             if await waitUntilProcessStopped(process.executableName, timeout: 1) {
@@ -802,10 +1320,32 @@ public actor MacSystemController: CleanroomSystemControlling {
         return await probeProcess(executableName: executableName) == .stopped
     }
 
-    private func restoreProcess(_ process: ManagedProcess) async -> ActionResult {
-        if await probeProcess(executableName: process.executableName) == .running {
+    private func restoreProcess(_ process: ManagedProcess, savedState: StoredProcess) async -> ActionResult {
+        let current = await probeProcessIdentity(executableName: process.executableName)
+        if current.state == .running {
+            let currentPIDs = Set(current.processIdentifiers)
+            let originalPIDs = Set(savedState.processIdentifiers)
+            let currentExecutables = Set(current.executableURLs.map(\.standardizedFileURL))
+            let savedExecutables = Set(savedState.executableURLs.map(\.standardizedFileURL))
+            if !savedExecutables.isEmpty, currentExecutables.isDisjoint(with: savedExecutables) {
+                return ActionResult(
+                    action: "restore process",
+                    target: process.name,
+                    outcome: .failed,
+                    detail: "A same-named process is running from a different executable than the recovery journal."
+                )
+            }
+            let detail =
+                currentPIDs.isDisjoint(with: originalPIDs)
+                ? "A matching process was independently relaunched as PID \(currentPIDs.sorted())."
+                : "The original recorded process remains running as PID \(currentPIDs.sorted())."
             return ActionResult(
-                action: "restore process", target: process.name, outcome: .skipped, detail: "Already running.")
+                action: "restore process",
+                target: process.name,
+                outcome: savedState.processIdentifiers.isEmpty ? .skipped : .warning,
+                detail: savedState.processIdentifiers.isEmpty
+                    ? "Already running; legacy journal has no PID provenance." : detail
+            )
         }
         guard let executable = process.relaunchCommand.first else {
             return ActionResult(
@@ -818,10 +1358,15 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
         let deadline = Date().addingTimeInterval(4)
         while Date() < deadline {
-            if await probeProcess(executableName: process.executableName) == .running {
+            let relaunched = await probeProcessIdentity(executableName: process.executableName)
+            let expectedExecutables = Set(savedState.executableURLs.map(\.standardizedFileURL))
+            let actualExecutables = Set(relaunched.executableURLs.map(\.standardizedFileURL))
+            if relaunched.state == .running,
+                expectedExecutables.isEmpty || !actualExecutables.isDisjoint(with: expectedExecutables)
+            {
                 return ActionResult(
                     action: "restore process", target: process.name, outcome: .succeeded,
-                    detail: "Relaunched saved process.")
+                    detail: "Relaunched saved process as PID \(started.standardOutput).")
             }
             try? await Task.sleep(for: .milliseconds(150))
         }
@@ -936,8 +1481,31 @@ public actor MacSystemController: CleanroomSystemControlling {
 
     private func timeMachineFindings() async -> [PreflightFinding] {
         let result = await commands.run("/usr/bin/tmutil", arguments: ["status"], timeout: 4)
-        guard result.succeeded else { return [] }
-        guard result.standardOutput.contains("Running = 1") else { return [] }
+        guard result.succeeded else {
+            return [
+                PreflightFinding(
+                    id: "time-machine-unknown",
+                    severity: .warning,
+                    category: "Storage",
+                    summary: "Time Machine activity is unknown",
+                    detail: commandFailure(result),
+                    remediation: "Re-run preflight before competitive play."
+                )
+            ]
+        }
+        guard result.standardOutput.contains("Running = 1") else {
+            if result.standardOutput.contains("Running = 0") { return [] }
+            return [
+                PreflightFinding(
+                    id: "time-machine-unknown",
+                    severity: .warning,
+                    category: "Storage",
+                    summary: "Time Machine returned an unrecognized status",
+                    detail: result.standardOutput,
+                    remediation: "Check Time Machine manually, then re-run preflight."
+                )
+            ]
+        }
         return [
             PreflightFinding(
                 id: "time-machine-running",
@@ -954,7 +1522,7 @@ public actor MacSystemController: CleanroomSystemControlling {
         var findings: [PreflightFinding] = []
         let karabiner = await commands.run(
             "/usr/bin/pgrep",
-            arguments: ["-if", "karabiner|VirtualHID"],
+            arguments: ["-U", "\(userIdentifier)", "-if", "karabiner|VirtualHID"],
             timeout: 3
         )
         if karabiner.succeeded {
@@ -1024,7 +1592,17 @@ public actor MacSystemController: CleanroomSystemControlling {
     private func networkFindings() async -> [PreflightFinding] {
         var findings: [PreflightFinding] = []
         let vpn = await commands.run("/usr/sbin/scutil", arguments: ["--nc", "list"], timeout: 4)
-        if vpn.succeeded, vpn.standardOutput.contains("(Connected)") {
+        if !vpn.succeeded {
+            findings.append(
+                PreflightFinding(
+                    id: "vpn-scan-unknown",
+                    severity: .warning,
+                    category: "Network",
+                    summary: "VPN connection state is unknown",
+                    detail: commandFailure(vpn),
+                    remediation: "Confirm the intended network path, then re-run preflight."
+                ))
+        } else if vpn.standardOutput.contains("(Connected)") {
             let connected = vpn.standardOutput.split(separator: "\n")
                 .filter { $0.contains("(Connected)") }
                 .map(String.init)
@@ -1061,6 +1639,16 @@ public actor MacSystemController: CleanroomSystemControlling {
                             "Keep the intended gameplay interface highest priority and avoid switching links mid-match."
                     ))
             }
+        } else {
+            findings.append(
+                PreflightFinding(
+                    id: "route-scan-unknown",
+                    severity: .warning,
+                    category: "Network",
+                    summary: "IPv4 route state is unknown",
+                    detail: commandFailure(routes),
+                    remediation: "Re-run preflight before competitive play."
+                ))
         }
         return findings
     }
@@ -1112,7 +1700,18 @@ public actor MacSystemController: CleanroomSystemControlling {
         }
 
         let battery = await commands.run("/usr/bin/pmset", arguments: ["-g", "batt"], timeout: 3)
-        if battery.succeeded, battery.standardOutput.contains("Battery Power") {
+        let activePowerSource = battery.succeeded ? Self.activePowerSource(from: battery.standardOutput) : nil
+        if !battery.succeeded || activePowerSource == nil {
+            findings.append(
+                PreflightFinding(
+                    id: "power-source-unknown",
+                    severity: .warning,
+                    category: "Power",
+                    summary: "Active power source is unknown",
+                    detail: battery.succeeded ? battery.standardOutput : commandFailure(battery),
+                    remediation: "Confirm AC or battery status, then re-run preflight."
+                ))
+        } else if activePowerSource == "Battery Power" {
             findings.append(
                 PreflightFinding(
                     id: "battery-power",
@@ -1124,11 +1723,23 @@ public actor MacSystemController: CleanroomSystemControlling {
                 ))
         }
         let power = await commands.run("/usr/bin/pmset", arguments: ["-g", "custom"], timeout: 3)
-        let lowPowerModeEnabled = power.standardOutput.split(separator: "\n").contains { line in
-            let fields = line.lowercased().split(whereSeparator: \.isWhitespace)
-            return fields.count == 2 && fields[0] == "lowpowermode" && fields[1] == "1"
-        }
-        if power.succeeded, lowPowerModeEnabled {
+        if !power.succeeded {
+            findings.append(
+                PreflightFinding(
+                    id: "power-profile-unknown",
+                    severity: .warning,
+                    category: "Power",
+                    summary: "Power profile could not be inspected",
+                    detail: commandFailure(power),
+                    remediation: "Re-run preflight before competitive play."
+                ))
+        } else if let activePowerSource,
+            let lowPowerModeEnabled = Self.lowPowerModeEnabled(
+                in: power.standardOutput,
+                activePowerSource: activePowerSource
+            )
+        {
+            guard lowPowerModeEnabled else { return findings }
             findings.append(
                 PreflightFinding(
                     id: "low-power-mode",
@@ -1138,8 +1749,47 @@ public actor MacSystemController: CleanroomSystemControlling {
                     detail: "Low Power Mode can reduce sustained performance.",
                     remediation: "Disable Low Power Mode before competitive play."
                 ))
+        } else if activePowerSource != nil {
+            findings.append(
+                PreflightFinding(
+                    id: "power-profile-unknown",
+                    severity: .warning,
+                    category: "Power",
+                    summary: "Active Low Power Mode state is unknown",
+                    detail: "pmset did not report Low Power Mode for the active power profile.",
+                    remediation: "Check Battery settings, then re-run preflight."
+                ))
         }
         return findings
+    }
+
+    static func activePowerSource(from output: String) -> String? {
+        guard let start = output.range(of: "Now drawing from '")?.upperBound,
+            let end = output[start...].firstIndex(of: "'")
+        else { return nil }
+        return String(output[start..<end])
+    }
+
+    static func lowPowerModeEnabled(
+        in output: String,
+        activePowerSource: String
+    ) -> Bool? {
+        var activeBlock = false
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasSuffix(":") {
+                activeBlock = trimmed.dropLast().caseInsensitiveCompare(activePowerSource) == .orderedSame
+                continue
+            }
+            guard activeBlock else { continue }
+            let fields = trimmed.lowercased().split(whereSeparator: \.isWhitespace)
+            if fields.count == 2, fields[0] == "lowpowermode" {
+                if fields[1] == "1" { return true }
+                if fields[1] == "0" { return false }
+                return nil
+            }
+        }
+        return nil
     }
 
     private func probeResult(
@@ -1200,8 +1850,48 @@ public actor MacSystemController: CleanroomSystemControlling {
         return detail.isEmpty ? "Command exited with status \(result.exitCode)." : detail
     }
 
+    private func applyFailurePolicy(
+        to result: ActionResult,
+        targetIdentifier: String,
+        profile: CleanroomProfile
+    ) -> ActionResult {
+        guard result.outcome.blocksCompletion,
+            profile.policy(for: targetIdentifier).failureSeverity == .warning
+        else { return result }
+        return ActionResult(
+            id: result.id,
+            action: result.action,
+            target: result.target,
+            outcome: .warning,
+            detail: "Non-blocking by profile policy: \(result.detail)",
+            occurredAt: result.occurredAt
+        )
+    }
+
     private func resultSort(_ lhs: ActionResult, _ rhs: ActionResult) -> Bool {
         if lhs.action != rhs.action { return lhs.action < rhs.action }
         return lhs.target < rhs.target
+    }
+}
+
+private enum RestoreComponent {
+    case service(ManagedService)
+    case application(ManagedApplication, StoredApplication)
+    case process(ManagedProcess, StoredProcess)
+
+    var identifier: String {
+        switch self {
+        case .service(let service): service.label
+        case .application(let application, _): application.bundleIdentifier
+        case .process(let process, _): process.executableName
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .service(let service): service.name
+        case .application(let application, _): application.name
+        case .process(let process, _): process.name
+        }
     }
 }

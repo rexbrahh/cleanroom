@@ -2,21 +2,48 @@ import AppKit
 import CleanroomCore
 import Foundation
 
+public struct ApplicationInstanceIdentity: Sendable, Equatable {
+    public let processIdentifier: Int32
+    public let bundleURL: URL?
+    public let executableURL: URL?
+
+    public init(processIdentifier: Int32, bundleURL: URL?, executableURL: URL?) {
+        self.processIdentifier = processIdentifier
+        self.bundleURL = bundleURL
+        self.executableURL = executableURL
+    }
+}
+
 public struct ApplicationProbe: Sendable, Equatable {
     public let state: ProbeState
     public let processIdentifier: Int32?
     public let executableURL: URL?
+    public let instances: [ApplicationInstanceIdentity]
     public let detail: String?
 
     public init(
         state: ProbeState,
         processIdentifier: Int32? = nil,
         executableURL: URL? = nil,
+        instances: [ApplicationInstanceIdentity] = [],
         detail: String? = nil
     ) {
         self.state = state
-        self.processIdentifier = processIdentifier
-        self.executableURL = executableURL
+        let resolvedInstances: [ApplicationInstanceIdentity]
+        if instances.isEmpty, let processIdentifier {
+            resolvedInstances = [
+                ApplicationInstanceIdentity(
+                    processIdentifier: processIdentifier,
+                    bundleURL: nil,
+                    executableURL: executableURL
+                )
+            ]
+        } else {
+            resolvedInstances = instances
+        }
+        self.processIdentifier = resolvedInstances.first?.processIdentifier ?? processIdentifier
+        self.executableURL = resolvedInstances.first?.executableURL ?? executableURL
+        self.instances = resolvedInstances
         self.detail = detail
     }
 }
@@ -25,6 +52,21 @@ public protocol ApplicationManaging: Sendable {
     func probe(bundleIdentifier: String) async -> ApplicationProbe
     func stop(bundleIdentifier: String, displayName: String) async -> ActionResult
     func start(bundleIdentifier: String, displayName: String) async -> ActionResult
+    func start(
+        bundleIdentifier: String,
+        displayName: String,
+        savedState: StoredApplication
+    ) async -> ActionResult
+}
+
+extension ApplicationManaging {
+    public func start(
+        bundleIdentifier: String,
+        displayName: String,
+        savedState: StoredApplication
+    ) async -> ActionResult {
+        await start(bundleIdentifier: bundleIdentifier, displayName: displayName)
+    }
 }
 
 @MainActor
@@ -35,13 +77,21 @@ public final class WorkspaceApplicationManager: ApplicationManaging {
         guard !bundleIdentifier.isEmpty else {
             return ApplicationProbe(state: .unknown, detail: "Empty bundle identifier.")
         }
-        guard let application = runningApplications(bundleIdentifier: bundleIdentifier).first else {
+        let applications = runningApplications(bundleIdentifier: bundleIdentifier)
+        guard let application = applications.first else {
             return ApplicationProbe(state: .stopped)
         }
         return ApplicationProbe(
             state: .running,
             processIdentifier: application.processIdentifier,
-            executableURL: application.executableURL
+            executableURL: application.executableURL,
+            instances: applications.map {
+                ApplicationInstanceIdentity(
+                    processIdentifier: $0.processIdentifier,
+                    bundleURL: $0.bundleURL,
+                    executableURL: $0.executableURL
+                )
+            }
         )
     }
 
@@ -81,19 +131,57 @@ public final class WorkspaceApplicationManager: ApplicationManaging {
     }
 
     public func start(bundleIdentifier: String, displayName: String) async -> ActionResult {
-        if !runningApplications(bundleIdentifier: bundleIdentifier).isEmpty {
+        await start(
+            bundleIdentifier: bundleIdentifier,
+            displayName: displayName,
+            savedState: StoredApplication(
+                bundleIdentifier: bundleIdentifier,
+                processIdentifiers: [],
+                bundleURLs: [],
+                executableURLs: []
+            )
+        )
+    }
+
+    public func start(
+        bundleIdentifier: String,
+        displayName: String,
+        savedState: StoredApplication
+    ) async -> ActionResult {
+        let running = runningApplications(bundleIdentifier: bundleIdentifier)
+        if !running.isEmpty {
+            let expectedPaths = Set(savedState.bundleURLs.map(\.standardizedFileURL.path))
+            let runningPaths = Set(running.compactMap { $0.bundleURL?.standardizedFileURL.path })
+            if !expectedPaths.isEmpty,
+                runningPaths.isEmpty || !runningPaths.isSubset(of: expectedPaths)
+            {
+                return ActionResult(
+                    action: "restore application",
+                    target: displayName,
+                    outcome: .failed,
+                    detail:
+                        "A different copy is running; expected one of: \(expectedPaths.sorted().joined(separator: ", "))."
+                )
+            }
+            let runningPIDs = Set(running.map(\.processIdentifier))
+            let originalPIDs = Set(savedState.processIdentifiers)
+            let detail =
+                runningPIDs.isDisjoint(with: originalPIDs)
+                ? "A matching application instance was independently relaunched as PID \(runningPIDs.sorted())."
+                : "The original recorded application instance remains running as PID \(runningPIDs.sorted())."
             return ActionResult(
                 action: "restore application",
                 target: displayName,
-                outcome: .skipped,
-                detail: "Already running."
+                outcome: savedState.processIdentifiers.isEmpty ? .skipped : .warning,
+                detail: savedState.processIdentifiers.isEmpty
+                    ? "Already running; legacy journal has no PID provenance." : detail
             )
         }
-        guard
-            let applicationURL = NSWorkspace.shared.urlForApplication(
-                withBundleIdentifier: bundleIdentifier
-            )
-        else {
+        let savedBundleURL = savedState.bundleURLs.first
+        let applicationURL =
+            savedBundleURL
+            ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+        guard let applicationURL else {
             return ActionResult(
                 action: "restore application",
                 target: displayName,
@@ -101,11 +189,19 @@ public final class WorkspaceApplicationManager: ApplicationManaging {
                 detail: "Application bundle could not be located."
             )
         }
+        if savedBundleURL != nil, !FileManager.default.fileExists(atPath: applicationURL.path) {
+            return ActionResult(
+                action: "restore application",
+                target: displayName,
+                outcome: .failed,
+                detail: "The saved application bundle is missing at \(applicationURL.path)."
+            )
+        }
 
         do {
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = false
-            _ = try await NSWorkspace.shared.openApplication(
+            let launched = try await NSWorkspace.shared.openApplication(
                 at: applicationURL,
                 configuration: configuration
             )
@@ -115,7 +211,8 @@ public final class WorkspaceApplicationManager: ApplicationManaging {
                 target: displayName,
                 outcome: running ? .succeeded : .failed,
                 detail: running
-                    ? "Relaunched in the background." : "Launch returned, but the app did not remain running."
+                    ? "Relaunched saved bundle as PID \(launched.processIdentifier)."
+                    : "Launch returned, but the app did not remain running."
             )
         } catch {
             return ActionResult(

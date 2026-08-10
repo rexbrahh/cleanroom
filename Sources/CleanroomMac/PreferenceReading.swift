@@ -49,7 +49,7 @@ public struct CFPreferenceReader: PreferenceReading {
         switch preference.kind {
         case .boolean:
             if CFGetTypeID(value) == CFBooleanGetTypeID() {
-                return stored(CFBooleanGetValue(value as! CFBoolean) ? "1" : "0")
+                return stored(CFBooleanGetValue((value as! CFBoolean)) ? "1" : "0")
             }
             if let number = value as? NSNumber {
                 return stored(number.boolValue ? "1" : "0")

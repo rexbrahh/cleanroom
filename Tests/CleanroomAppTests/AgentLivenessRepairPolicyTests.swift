@@ -15,14 +15,36 @@ struct AgentLivenessRepairPolicyTests {
     func installerAuthorizationMatchesBuild() {
         #expect(
             CleanroomViewModel.installerReplacementIsAuthorized(
-                markerBuild: "7\n",
-                currentBuild: "7"
+                markerBuild: "8\n",
+                currentBuild: "8"
             )
         )
         #expect(
             !CleanroomViewModel.installerReplacementIsAuthorized(
                 markerBuild: "6",
-                currentBuild: "7"
+                currentBuild: "8"
+            )
+        )
+    }
+
+    @Test("registration and cooldown suppress automatic kickstart")
+    func registrationSuppressesAutomaticRepair() {
+        #expect(
+            !CleanroomViewModel.shouldAttemptAutomaticLivenessRepair(
+                registrationInProgress: true,
+                elapsedSinceRegistrationRepair: 60
+            )
+        )
+        #expect(
+            !CleanroomViewModel.shouldAttemptAutomaticLivenessRepair(
+                registrationInProgress: false,
+                elapsedSinceRegistrationRepair: 29
+            )
+        )
+        #expect(
+            CleanroomViewModel.shouldAttemptAutomaticLivenessRepair(
+                registrationInProgress: false,
+                elapsedSinceRegistrationRepair: 30
             )
         )
     }

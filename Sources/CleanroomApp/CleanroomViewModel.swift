@@ -297,8 +297,8 @@ final class CleanroomViewModel: ObservableObject {
                     try await service.unregister()
                     try await Task.sleep(for: .seconds(1))
                     try service.register()
+                    lastRegistrationRepairAt = Date()
                     if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
-                    clearInstallerReplacementAuthorization()
                     registrationMessage = "Background agent updated and enabled"
                     agentRegistrationReady = true
                 } else if digest == nil || registeredDigest != digest {
@@ -317,8 +317,8 @@ final class CleanroomViewModel: ObservableObject {
                 agentRegistrationReady = false
             case .notRegistered, .notFound:
                 try service.register()
+                lastRegistrationRepairAt = Date()
                 if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
-                clearInstallerReplacementAuthorization()
                 registrationMessage =
                     service.status == .requiresApproval
                     ? "Background agent requires approval in Login Items"
@@ -342,6 +342,13 @@ final class CleanroomViewModel: ObservableObject {
         markerBuild?.trimmingCharacters(in: .whitespacesAndNewlines) == currentBuild
     }
 
+    nonisolated static func shouldAttemptAutomaticLivenessRepair(
+        registrationInProgress: Bool,
+        elapsedSinceRegistrationRepair: TimeInterval
+    ) -> Bool {
+        !registrationInProgress && elapsedSinceRegistrationRepair >= 30
+    }
+
     private func installerReplacementIsAuthorized() -> Bool {
         let marker = try? String(
             contentsOf: Self.installerReplacementAuthorizationURL,
@@ -354,6 +361,8 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     private func clearInstallerReplacementAuthorization() {
+        guard FileManager.default.fileExists(atPath: Self.installerReplacementAuthorizationURL.path)
+        else { return }
         try? FileManager.default.removeItem(at: Self.installerReplacementAuthorizationURL)
     }
 
@@ -392,6 +401,9 @@ final class CleanroomViewModel: ObservableObject {
             if self.status != status {
                 self.status = status
             }
+            if response.agentBuild == CleanroomBuildIdentity.current {
+                clearInstallerReplacementAuthorization()
+            }
             let resolvedPreflight = status.preflight ?? preflight
             if self.preflight != resolvedPreflight {
                 self.preflight = resolvedPreflight
@@ -419,7 +431,10 @@ final class CleanroomViewModel: ObservableObject {
             connectionMessage = message
             await client.invalidate()
             if status?.incidentMode == true { return }
-            if Date().timeIntervalSince(lastRegistrationRepairAt) >= 30 {
+            if Self.shouldAttemptAutomaticLivenessRepair(
+                registrationInProgress: registrationInProgress,
+                elapsedSinceRegistrationRepair: Date().timeIntervalSince(lastRegistrationRepairAt)
+            ) {
                 lastRegistrationRepairAt = Date()
                 await repairAgentLiveness()
             }

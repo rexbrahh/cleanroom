@@ -6,6 +6,9 @@ SOURCE_APP="$ROOT/dist/Cleanroom.app"
 DESTINATION_DIR="${CLEANROOM_DESTINATION_DIR:-$HOME/Applications}"
 DESTINATION_APP="$DESTINATION_DIR/Cleanroom.app"
 CLI_LINK_DIR="${CLEANROOM_CLI_LINK_DIR:-$HOME/bin}"
+SUPPORT_DIR="${CLEANROOM_HOME:-$HOME/Library/Application Support/Cleanroom}"
+RECOVERY_JOURNAL="$SUPPORT_DIR/recovery.json"
+REPLACEMENT_AUTHORIZATION="$SUPPORT_DIR/replace-agent-registration"
 
 AGENT_REL="Contents/Library/LaunchServices/cleanroom-agent"
 OLD_HASH=""
@@ -57,11 +60,20 @@ trap - EXIT
 
 # Restart the agent only when its binary is unchanged. A changed binary has a
 # new code hash, so launchd refuses to respawn it (EX_CONFIG) until the menu
-# app refreshes the registration through SMAppService.
+# app refreshes the registration through SMAppService. The installer grants
+# that one-shot replacement only when no recovery journal protects live state.
 if [[ -n "$OLD_HASH" && "$OLD_HASH" == "$NEW_HASH" ]]; then
   /bin/launchctl kickstart -k "gui/$(id -u)/com.rex.cleanroom.agent" 2>/dev/null || true
+elif [[ ! -e "$RECOVERY_JOURNAL" ]]; then
+  /bin/mkdir -p "$SUPPORT_DIR"
+  /bin/chmod 700 "$SUPPORT_DIR"
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$DESTINATION_APP/Contents/Info.plist" \
+    > "$REPLACEMENT_AUTHORIZATION"
+  /bin/chmod 600 "$REPLACEMENT_AUTHORIZATION"
+  print -r -- "Agent replacement authorized for this installed build."
 else
-  print -r -- "Agent binary changed; open Cleanroom.app to refresh its registration."
+  /bin/rm -f "$REPLACEMENT_AUTHORIZATION"
+  print -r -- "Agent binary changed, but active recovery state blocks automatic replacement."
 fi
 
 print -r -- "Installed $DESTINATION_APP"

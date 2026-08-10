@@ -440,7 +440,7 @@ private struct DashboardView: View {
     @ViewBuilder
     private var preflightCard: some View {
         GroupBox("Competitive preflight") {
-            if let report = model.preflight {
+            if let report = model.preflight, report.isCurrent() {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(report.probes ?? []) { probe in
                         HStack {
@@ -479,6 +479,12 @@ private struct DashboardView: View {
                         if finding.id != report.findings.last?.id { Divider() }
                     }
                 }
+                .padding(.vertical, 4)
+            } else if let report = model.preflight {
+                Text(
+                    "The last preflight expired at \(report.generatedAt.formatted(date: .abbreviated, time: .standard)). Run a new preflight for current findings."
+                )
+                .foregroundStyle(.secondary)
                 .padding(.vertical, 4)
             } else {
                 Text(

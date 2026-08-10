@@ -7,7 +7,24 @@ struct AgentLivenessRepairPolicyTests {
     @Test("automatic connection failure cannot authorize destructive replacement")
     func automaticFailureIsNonDestructive() {
         #expect(!AgentLivenessRepairTrigger.automaticFailure.permitsDestructiveReplacement)
+        #expect(AgentLivenessRepairTrigger.installerAuthorizedReplacement.permitsDestructiveReplacement)
         #expect(AgentLivenessRepairTrigger.userRequestedReplacement.permitsDestructiveReplacement)
+    }
+
+    @Test("installer authorization is scoped to the installed build")
+    func installerAuthorizationMatchesBuild() {
+        #expect(
+            CleanroomViewModel.installerReplacementIsAuthorized(
+                markerBuild: "7\n",
+                currentBuild: "7"
+            )
+        )
+        #expect(
+            !CleanroomViewModel.installerReplacementIsAuthorized(
+                markerBuild: "6",
+                currentBuild: "7"
+            )
+        )
     }
 
     @Test("setup completion requires registration, XPC, and manual menu confirmation")

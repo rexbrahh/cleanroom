@@ -23,6 +23,8 @@ struct PreflightFreshnessTests {
         )
 
         let freshReport = PreflightReport(generatedAt: checkedAt, findings: [], probes: [fresh])
+        #expect(freshReport.isCurrent(at: checkedAt.addingTimeInterval(120)))
+        #expect(!freshReport.isCurrent(at: checkedAt.addingTimeInterval(121)))
         #expect(freshReport.isReady(at: checkedAt.addingTimeInterval(119)))
         #expect(!freshReport.isReady(at: checkedAt.addingTimeInterval(121)))
         #expect(

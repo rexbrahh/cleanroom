@@ -2,6 +2,9 @@
 
 ## 3.2.0
 
+- Refreshes a changed background-agent registration after a recovery-safe local
+  install and hides expired preflight findings instead of presenting stale
+  process data as current.
 - Adds named gameplay profiles, per-device calibration, global shortcuts, and
   deterministic session simulation without expanding the agent's mutation
   boundary.

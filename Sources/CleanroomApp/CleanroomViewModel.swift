@@ -12,10 +12,11 @@ import UniformTypeIdentifiers
 
 enum AgentLivenessRepairTrigger {
     case automaticFailure
+    case installerAuthorizedReplacement
     case userRequestedReplacement
 
     var permitsDestructiveReplacement: Bool {
-        self == .userRequestedReplacement
+        self != .automaticFailure
     }
 }
 
@@ -81,6 +82,10 @@ final class CleanroomViewModel: ObservableObject {
     private static let updateChannelPreferenceKey = "updateChannel"
     private static let setupCompletedPreferenceKey = "setupDoctorCompleted"
     private static let menuItemConfirmedPreferenceKey = "setupDoctorMenuItemConfirmed"
+    private static let installerReplacementAuthorizationURL =
+        CleanroomPaths.applicationSupportDirectory.appendingPathComponent(
+            "replace-agent-registration"
+        )
 
     init() {
         // Keep ServiceManagement and UserNotifications IPC out of the app's
@@ -236,11 +241,15 @@ final class CleanroomViewModel: ObservableObject {
         started = true
         logger.notice("View model started; refreshing registration state")
         Task { [weak self] in
-            await self?.refreshAgentRegistration()
-            await self?.refreshProfiles()
-            await self?.refreshCalibration()
-            await self?.refreshNotificationAuthorization()
-            self?.refreshLaunchAtLoginStatus()
+            guard let self else { return }
+            await refreshAgentRegistration(
+                trigger: installerReplacementIsAuthorized()
+                    ? .installerAuthorizedReplacement : .automaticFailure
+            )
+            await refreshProfiles()
+            await refreshCalibration()
+            await refreshNotificationAuthorization()
+            refreshLaunchAtLoginStatus()
         }
         pollingTask = Task { [weak self] in
             guard let self else { return }
@@ -289,6 +298,7 @@ final class CleanroomViewModel: ObservableObject {
                     try await Task.sleep(for: .seconds(1))
                     try service.register()
                     if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
+                    clearInstallerReplacementAuthorization()
                     registrationMessage = "Background agent updated and enabled"
                     agentRegistrationReady = true
                 } else if digest == nil || registeredDigest != digest {
@@ -308,6 +318,7 @@ final class CleanroomViewModel: ObservableObject {
             case .notRegistered, .notFound:
                 try service.register()
                 if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
+                clearInstallerReplacementAuthorization()
                 registrationMessage =
                     service.status == .requiresApproval
                     ? "Background agent requires approval in Login Items"
@@ -322,6 +333,28 @@ final class CleanroomViewModel: ObservableObject {
             agentRegistrationReady = false
             logger.error("Agent registration failed: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    nonisolated static func installerReplacementIsAuthorized(
+        markerBuild: String?,
+        currentBuild: String
+    ) -> Bool {
+        markerBuild?.trimmingCharacters(in: .whitespacesAndNewlines) == currentBuild
+    }
+
+    private func installerReplacementIsAuthorized() -> Bool {
+        let marker = try? String(
+            contentsOf: Self.installerReplacementAuthorizationURL,
+            encoding: .utf8
+        )
+        return Self.installerReplacementIsAuthorized(
+            markerBuild: marker,
+            currentBuild: CleanroomBuildIdentity.current.build
+        )
+    }
+
+    private func clearInstallerReplacementAuthorization() {
+        try? FileManager.default.removeItem(at: Self.installerReplacementAuthorizationURL)
     }
 
     private func currentRegistrationDigest() -> String? {

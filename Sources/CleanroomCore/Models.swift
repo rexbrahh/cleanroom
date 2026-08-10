@@ -553,6 +553,13 @@ public struct PreflightReport: Codable, Equatable, Sendable {
         findings.map(\.severity).max() ?? .information
     }
 
+    public func isCurrent(
+        at date: Date = Date(),
+        maximumAge: TimeInterval = 120
+    ) -> Bool {
+        date.timeIntervalSince(generatedAt) <= maximumAge
+    }
+
     public func isFreshAndComplete(
         at date: Date = Date(),
         maximumAge: TimeInterval = 120

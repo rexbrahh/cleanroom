@@ -50,7 +50,32 @@ cleanroomctl status
 cleanroomctl preflight
 cleanroomctl restore
 cleanroomctl events --limit 20
+cleanroomctl doctor --json
+cleanroomctl watch --count 30 --interval 2 --json
 ```
+
+Engine scenarios can run without desktop mutation:
+
+```sh
+swift run cleanroom-sim --example > /private/tmp/cleanroom-scenario.json
+swift run cleanroom-sim /private/tmp/cleanroom-scenario.json
+```
+
+Scenario events can set trigger state, advance virtual time, queue system
+outcomes or timeouts, corrupt the next journal read, restart the engine, and
+run engine commands. Identical input produces identical normalized output.
+
+`cleanroomctl` uses stable exit codes:
+
+| Code | Meaning |
+|---:|---|
+| 0 | Requested state is healthy or contains no critical preflight finding. |
+| 2 | Status or transition is degraded. |
+| 3 | Preflight contains a critical finding. |
+| 4 | Agent protocol or response validation failed. |
+| 5 | The agent is unreachable or timed out twice. |
+| 6 | The request is still running and was not started again. |
+| 7 | One or more doctor checks failed. |
 
 The LaunchAgent continues watching when the menu-bar UI is closed. Use Pause
 in the menu or `cleanroomctl pause` to suppress new cleanroom entry; restoration
@@ -71,7 +96,8 @@ remaining automatic restore path.
 GitHub Actions runs Swift formatting checks, the complete test suite, release
 assembly, nested code-signature verification, and ZIP validation on pushes to
 `main`, pull requests, and manual dispatches. Successful runs upload
-`Cleanroom.zip` and its SHA-256 checksum as a 14-day workflow artifact.
+`Cleanroom.zip`, its SHA-256 checksum, and a stable-channel update manifest as
+a 14-day workflow artifact.
 
 To reproduce the artifact locally:
 
@@ -82,8 +108,19 @@ To reproduce the artifact locally:
 
 Semantic tags such as `v2.0.0` additionally create a durable private GitHub
 release containing the verified app ZIP and SHA-256 checksum. Build metadata is
-injected with `CLEANROOM_VERSION` and `CLEANROOM_BUILD_NUMBER`, keeping the app
-bundle version aligned with the tag.
+read from `Resources/Info.plist` for local builds and can be injected with
+`CLEANROOM_VERSION` and `CLEANROOM_BUILD_NUMBER` for releases. Assembly fails if
+the app, CLI, and agent do not all report the injected identity.
+
+Stable tags use `vMAJOR.MINOR.PATCH`; beta releases use
+`vMAJOR.MINOR.PATCH-beta.NUMBER`. Packaging emits schema-validated stable or
+beta metadata and verifies the archive checksum before publication. The
+installer preserves the previous bundle; `scripts/rollback-app.sh` swaps an
+exact verified previous bundle back atomically. Developer ID signing is set by
+`CLEANROOM_SIGN_IDENTITY`. Notarization is deliberately credential-gated by
+`CLEANROOM_NOTARY_PROFILE`; set `CLEANROOM_REQUIRE_NOTARIZATION=1` to make a
+missing credential fail packaging rather than produce an explicitly
+unnotarized artifact.
 
 ## Network boundary
 
@@ -95,3 +132,11 @@ routes, DNS, or network interfaces.
 The Policy screen lists the complete mutation set and separately identifies
 operator-controlled software. This makes the boundary visible in the app in
 addition to enforcing it in tests.
+
+## Support bundles
+
+The Activity screen can create a local ZIP containing only bounded status,
+probe freshness, outcome counts, recovery times, and performance timings. Its
+manifest lists every omitted field, including process identity, journal state,
+preference values, action details, network targets, hardware identity, and
+paths. Cleanroom has no support-upload or automatic-submission path.

@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 3.2.0
+
+- Adds named gameplay profiles, per-device calibration, global shortcuts, and
+  deterministic session simulation without expanding the agent's mutation
+  boundary.
+- Adds authenticated build handshakes, bounded XPC admission, durable recovery
+  receipts, and safer ownership transfer across app and agent replacement.
+- Adds telemetry summaries, pressure alerts, update metadata verification, and
+  redacted support bundles for faster diagnosis without exposing private data.
+- Adds transactional app installation with version validation, rollback, and
+  stable-channel manifest verification.
+- Expands automated coverage across the agent, app, CLI, installer, recovery,
+  profiles, diagnostics, simulation, networking, and update paths.
 
 - Entry no longer waits for preflight: inspection runs after the session is
   secured for the non-gating profile, cutting roughly 1.5s off cleanroom

@@ -5,6 +5,8 @@ play. It detects Roblox, snapshots the user's current desktop/input state,
 temporarily suppresses selected sources of interference, and restores the exact
 saved state when Roblox exits.
 
+Cleanroom 3.2.1 and later require macOS 15 or later.
+
 The first release is intentionally focused on one Mac and one game profile.
 The background agent owns all state transitions; the menu-bar app and
 `cleanroomctl` are clients.

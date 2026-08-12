@@ -16,8 +16,9 @@ SCHEMA="$(/usr/bin/plutil -extract schemaVersion raw -o - "$MANIFEST")"
 CHANNEL="$(/usr/bin/plutil -extract channel raw -o - "$MANIFEST")"
 URL="$(/usr/bin/plutil -extract archiveURL raw -o - "$MANIFEST")"
 EXPECTED="$(/usr/bin/plutil -extract sha256 raw -o - "$MANIFEST")"
-[[ "$SCHEMA" == 1 && ( "$CHANNEL" == stable || "$CHANNEL" == beta ) && "$URL" == https://* ]] || {
-  print -u2 -r -- "Update manifest schema, channel, or HTTPS URL is invalid."
+MINIMUM_SYSTEM_VERSION="$(/usr/bin/plutil -extract minimumSystemVersion raw -o - "$MANIFEST")"
+[[ "$SCHEMA" == 1 && ( "$CHANNEL" == stable || "$CHANNEL" == beta ) && "$URL" == https://* && "$MINIMUM_SYSTEM_VERSION" == 15.0 ]] || {
+  print -u2 -r -- "Update manifest schema, channel, HTTPS URL, or minimum system version is invalid."
   exit 65
 }
 ACTUAL="$(/usr/bin/shasum -a 256 "$ARCHIVE" | /usr/bin/awk '{print $1}')"

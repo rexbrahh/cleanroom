@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "Cleanroom",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v15)
     ],
     products: [
         .library(name: "CleanroomCore", targets: ["CleanroomCore"]),

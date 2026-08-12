@@ -62,7 +62,13 @@ trap - EXIT
 # new code hash, so launchd refuses to respawn it (EX_CONFIG) until the menu
 # app refreshes the registration through SMAppService. The installer grants
 # that one-shot replacement only when no recovery journal protects live state.
-if [[ -n "$OLD_HASH" && "$OLD_HASH" == "$NEW_HASH" ]]; then
+NEW_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$DESTINATION_APP/Contents/Info.plist")"
+REGISTERED_BUILD="$(
+  /bin/launchctl print "gui/$(id -u)/com.rex.cleanroom.agent" 2>/dev/null \
+    | /usr/bin/awk -F' = ' '/parent bundle version =/{print $2; exit}' \
+    || true
+)"
+if [[ -n "$OLD_HASH" && "$OLD_HASH" == "$NEW_HASH" && "$REGISTERED_BUILD" == "$NEW_BUILD" ]]; then
   /bin/launchctl kickstart -k "gui/$(id -u)/com.rex.cleanroom.agent" 2>/dev/null || true
 elif [[ ! -e "$RECOVERY_JOURNAL" ]]; then
   /bin/mkdir -p "$SUPPORT_DIR"

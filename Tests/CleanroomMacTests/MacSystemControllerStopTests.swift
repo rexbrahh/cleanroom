@@ -6,6 +6,19 @@ import Testing
 
 @Suite("macOS stop and defaults robustness")
 struct MacSystemControllerStopTests {
+    @Test("basename-only process output resolves through native process identity")
+    func basenameProcessOutputResolvesExecutable() {
+        let reportedPath = URL(fileURLWithPath: CommandLine.arguments[0]).lastPathComponent
+
+        let executableURL = MacSystemController.processExecutableURL(
+            processIdentifier: ProcessInfo.processInfo.processIdentifier,
+            reportedPath: reportedPath
+        )
+
+        #expect(executableURL?.path.hasPrefix("/") == true)
+        #expect(executableURL?.lastPathComponent == reportedPath)
+    }
+
     @Test("stop process succeeds when the process exits on its own during termination")
     func stopProcessIsPostconditionDriven() async {
         let commands = VanishingProcessCommandRunner()

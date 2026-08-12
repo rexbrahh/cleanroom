@@ -20,6 +20,7 @@ struct UpdateMetadataTests {
             )
             try manifest.verify(archive: archive)
             #expect(manifest.channel == channel)
+            #expect(manifest.minimumSystemVersion == "15.0")
             #expect(throws: CleanroomUpdateError.checksumMismatch) {
                 try manifest.verify(archive: Data("tampered".utf8))
             }

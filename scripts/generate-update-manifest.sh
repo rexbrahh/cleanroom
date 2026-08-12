@@ -24,7 +24,7 @@ BASE_URL="${CLEANROOM_UPDATE_BASE_URL:-https://github.com/rexbrahh/cleanroom/rel
 
 SHA256="$(/usr/bin/shasum -a 256 "$ARCHIVE" | /usr/bin/awk '{print $1}')"
 PUBLISHED_AT="$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
-print -r -- "{\"schemaVersion\":1,\"channel\":\"$CHANNEL\",\"version\":\"$VERSION\",\"build\":\"$BUILD\",\"archiveURL\":\"$BASE_URL/Cleanroom.zip\",\"sha256\":\"$SHA256\",\"minimumSystemVersion\":\"14.0\",\"publishedAt\":\"$PUBLISHED_AT\"}" > "$MANIFEST"
+print -r -- "{\"schemaVersion\":1,\"channel\":\"$CHANNEL\",\"version\":\"$VERSION\",\"build\":\"$BUILD\",\"archiveURL\":\"$BASE_URL/Cleanroom.zip\",\"sha256\":\"$SHA256\",\"minimumSystemVersion\":\"15.0\",\"publishedAt\":\"$PUBLISHED_AT\"}" > "$MANIFEST"
 /usr/bin/plutil -extract schemaVersion raw -o - "$MANIFEST" >/dev/null
 /usr/bin/plutil -extract sha256 raw -o - "$MANIFEST" >/dev/null
 print -r -- "$MANIFEST"

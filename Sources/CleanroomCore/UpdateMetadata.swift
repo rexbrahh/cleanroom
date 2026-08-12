@@ -24,7 +24,7 @@ public struct CleanroomUpdateManifest: Codable, Equatable, Sendable {
         build: String,
         archiveURL: URL,
         sha256: String,
-        minimumSystemVersion: String = "14.0",
+        minimumSystemVersion: String = "15.0",
         publishedAt: Date = Date()
     ) {
         self.schemaVersion = schemaVersion

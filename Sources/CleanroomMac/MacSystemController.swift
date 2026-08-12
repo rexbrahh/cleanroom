@@ -1,4 +1,5 @@
 import CleanroomCore
+import Darwin
 import Foundation
 
 public actor MacSystemController: CleanroomSystemControlling {
@@ -1244,13 +1245,29 @@ public actor MacSystemController: CleanroomSystemControlling {
                     timeout: 3
                 )
                 let path = identity.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard identity.succeeded, path.hasPrefix("/") else { return (.unknown, [], []) }
-                executableURLs.append(URL(fileURLWithPath: path))
+                guard identity.succeeded,
+                    let executableURL = Self.processExecutableURL(
+                        processIdentifier: processIdentifier,
+                        reportedPath: path
+                    )
+                else { return (.unknown, [], []) }
+                executableURLs.append(executableURL)
             }
             return (.running, processIdentifiers, executableURLs)
         }
         if !result.timedOut, result.launchError == nil, result.exitCode == 1 { return (.stopped, [], []) }
         return (.unknown, [], [])
+    }
+
+    static func processExecutableURL(processIdentifier: Int32, reportedPath: String) -> URL? {
+        if reportedPath.hasPrefix("/") { return URL(fileURLWithPath: reportedPath) }
+
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        guard proc_pidpath(processIdentifier, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        let path = buffer.withUnsafeBytes {
+            String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+        return URL(fileURLWithPath: path)
     }
 
     private func probeProcess(executableName: String) async -> ProbeState {

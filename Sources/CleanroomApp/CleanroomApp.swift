@@ -12,7 +12,6 @@ struct CleanroomApp: App {
     private static let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
 
     init() {
-        Self.sanitizeStatusItemPosition()
         Self.logger.notice("Cleanroom menu app launched")
         let model = CleanroomViewModel()
         _model = StateObject(wrappedValue: model)
@@ -44,27 +43,6 @@ struct CleanroomApp: App {
         }
     }
 
-    /// Removes a persisted status-item position that is stranded off every
-    /// connected screen (e.g. saved while an external display was attached).
-    /// macOS autosaves the position but does not always clamp it back on
-    /// screen, which leaves the menu-bar item invisible.
-    private static func sanitizeStatusItemPosition() {
-        let key = "NSStatusItem Preferred Position Item-0"
-        let defaults = UserDefaults.standard
-        guard let saved = defaults.object(forKey: key) as? NSNumber else { return }
-        let position = CGFloat(saved.doubleValue)
-        let screens = NSScreen.screens
-        guard !screens.isEmpty else { return }
-        let onScreen = screens.contains { screen in
-            position >= screen.frame.minX && position <= screen.frame.maxX
-        }
-        if !onScreen {
-            defaults.removeObject(forKey: key)
-            logger.notice(
-                "Removed off-screen status-item position \(saved.doubleValue, privacy: .public)"
-            )
-        }
-    }
 }
 
 /// Logs a one-time window inventory a few seconds after launch so menu-bar
@@ -99,20 +77,28 @@ private struct CleanroomMenu: View {
                 .foregroundStyle(.secondary)
             Divider()
             Button("Competitive Preflight") { model.runPreflight() }
-                .disabled(model.operationInProgress)
+                .disabled(model.operationInProgress || !model.agentConnected)
                 .keyboardShortcut("p")
             Button("Enter / Re-enforce") { model.enter() }
-                .disabled(model.operationInProgress)
+                .disabled(model.operationInProgress || !model.agentConnected)
                 .keyboardShortcut("e")
             Button("Safe Launch Roblox") { model.safeLaunch() }
-                .disabled(model.operationInProgress || model.status?.trigger.state != .stopped)
+                .disabled(
+                    model.operationInProgress || !model.agentConnected
+                        || model.status?.trigger.state != .stopped
+                )
             Button("Restore Saved State") { model.restore() }
-                .disabled(model.operationInProgress || model.status?.journal == nil)
+                .disabled(
+                    model.operationInProgress || !model.agentConnected || model.status?.journal == nil
+                )
                 .keyboardShortcut("r")
             Button(model.status?.phase == .paused ? "Resume Automatic Control" : "Pause Automatic Control") {
                 model.togglePause()
             }
-            .disabled(model.operationInProgress || model.status?.incidentMode == true)
+            .disabled(
+                model.operationInProgress || !model.agentConnected
+                    || model.status?.incidentMode == true
+            )
             Button(model.status?.incidentMode == true ? "Exit Incident Mode" : "Enter Incident Mode") {
                 if model.status?.incidentMode == true {
                     model.exitIncidentMode()
@@ -120,6 +106,7 @@ private struct CleanroomMenu: View {
                     model.enterIncidentMode()
                 }
             }
+            .disabled(model.operationInProgress || !model.agentConnected)
             Divider()
             Button("Open Cleanroom…") {
                 openWindow(id: "dashboard")
@@ -194,10 +181,10 @@ private struct DashboardView: View {
                 }
                 Spacer()
                 Button("Sample Latency") { model.sampleNetworkLatency() }
-                    .disabled(model.operationInProgress)
+                    .disabled(model.operationInProgress || !model.agentConnected)
                 Button("Run Preflight") { model.runPreflight() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.operationInProgress)
+                    .disabled(model.operationInProgress || !model.agentConnected)
             }
             preflightCard
             if let latency = model.networkLatency {
@@ -254,8 +241,8 @@ private struct DashboardView: View {
                 )
                 setupRow(
                     title: "Authenticated agent connection",
-                    detail: model.status == nil ? model.connectionMessage : "Live XPC status received",
-                    complete: model.status != nil
+                    detail: model.agentConnected ? "Live XPC status received" : model.connectionMessage,
+                    complete: model.agentConnected
                 )
                 setupRow(
                     title: "Notification permission",
@@ -362,7 +349,7 @@ private struct DashboardView: View {
                     Button("Open Login Items") { model.openLoginItemsSettings() }
                 } else if model.preflight?.findings.contains(where: { $0.id == "legacy-agent" }) == true {
                     Button("Migrate Legacy Watcher") { model.migrateLegacy() }
-                } else if model.status == nil {
+                } else if !model.agentConnected {
                     Button("Replace Agent Registration") { model.registerAgent() }
                 }
             }
@@ -432,7 +419,7 @@ private struct DashboardView: View {
                         .disabled(model.status?.incidentMode == true)
                 }
             }
-            .disabled(model.operationInProgress)
+            .disabled(model.operationInProgress || !model.agentConnected)
             .padding(.vertical, 4)
         }
     }
@@ -937,18 +924,18 @@ private struct CleanroomSettingsView: View {
 
             Section("Build") {
                 LabeledContent("Version", value: model.appVersion)
-                LabeledContent("Profile", value: "Roblox / Phantom Forces")
+                LabeledContent(
+                    "Profile", value: model.status?.activeProfile?.name ?? "Agent unavailable"
+                )
                 LabeledContent("Network control", value: "Read-only observations")
-                Picker(
-                    "Update channel",
-                    selection: Binding(
-                        get: { model.updateChannel },
-                        set: { model.setUpdateChannel($0) }
-                    )
-                ) {
-                    Text("Stable").tag(CleanroomUpdateChannel.stable)
-                    Text("Beta").tag(CleanroomUpdateChannel.beta)
-                }
+                LabeledContent("Updates", value: "Manual install")
+                Link(
+                    "Open Cleanroom Releases",
+                    destination: URL(string: "https://github.com/rexbrahh/cleanroom/releases")!
+                )
+                Text("Cleanroom does not download or install updates from Settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

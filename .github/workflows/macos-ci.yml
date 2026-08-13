@@ -35,6 +35,9 @@ jobs:
       - name: Run tests
         run: swift test
 
+      - name: Test release identity gate
+        run: ./scripts/test-release-identity.sh
+
       - name: Build release binaries
         run: swift build -c release
 

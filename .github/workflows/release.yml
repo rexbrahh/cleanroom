@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
 
       - name: Validate release tag
         run: |
@@ -25,6 +27,15 @@ jobs:
             echo "Expected v3.0.0 or v3.0.0-beta.1" >&2
             exit 1
           fi
+          PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          PREVIOUS_BUILD=0
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            git show "${PREVIOUS_TAG}:Resources/Info.plist" > "$RUNNER_TEMP/previous-info.plist"
+            PREVIOUS_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RUNNER_TEMP/previous-info.plist")"
+          fi
+          read RELEASE_VERSION RELEASE_BUILD_NUMBER <<< "$(./scripts/release-identity.sh "$GITHUB_REF_NAME" "$PREVIOUS_BUILD")"
+          echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_BUILD_NUMBER=$RELEASE_BUILD_NUMBER" >> "$GITHUB_ENV"
 
       - name: Lint Swift formatting
         run: swift format lint --recursive --parallel Sources Tests Package.swift
@@ -34,10 +45,8 @@ jobs:
 
       - name: Assemble versioned app
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION%%-beta.*}"
-          CLEANROOM_VERSION="$VERSION" \
-            CLEANROOM_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
+          CLEANROOM_VERSION="$RELEASE_VERSION" \
+            CLEANROOM_BUILD_NUMBER="$RELEASE_BUILD_NUMBER" \
             ./scripts/build-app.sh
 
       - name: Package verified app

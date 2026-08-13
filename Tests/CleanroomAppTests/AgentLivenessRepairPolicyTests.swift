@@ -1,9 +1,30 @@
+import CleanroomCore
+import Foundation
 import Testing
 
 @testable import CleanroomApp
 
 @Suite("Agent liveness repair policy")
 struct AgentLivenessRepairPolicyTests {
+    @Test("a failed live connection cannot be presented as healthy from cached status")
+    @MainActor
+    func cachedStatusDoesNotMaskConnectionFailure() {
+        let model = CleanroomViewModel()
+        model.status = CleanroomStatus(
+            phase: .idle,
+            trigger: TriggerProbe(state: .stopped),
+            journal: nil,
+            lastMessage: "Roblox is not running.",
+            lastResults: [],
+            preflight: nil,
+            heartbeatAt: Date()
+        )
+        model.connectionMessage = "Agent unavailable: request timed out"
+
+        #expect(model.agentHealth == .unavailable)
+        #expect(!model.setupDoctorState.xpcConnected)
+    }
+
     @Test("automatic connection failure cannot authorize destructive replacement")
     func automaticFailureIsNonDestructive() {
         #expect(!AgentLivenessRepairTrigger.automaticFailure.permitsDestructiveReplacement)

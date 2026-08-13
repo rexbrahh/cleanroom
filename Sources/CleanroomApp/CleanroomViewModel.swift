@@ -57,7 +57,6 @@ final class CleanroomViewModel: ObservableObject {
     @Published var performanceAlertsEnabled: Bool
     @Published var thermalAlertThreshold: ThermalPressureLevel
     @Published var batteryAlertThreshold: Int
-    @Published var updateChannel: CleanroomUpdateChannel
     @Published var notificationMessage = "Gameplay notifications are off"
     @Published var launchAtLoginEnabled = false
     @Published var launchAtLoginMessage = "Checking menu-app launch at login…"
@@ -79,7 +78,6 @@ final class CleanroomViewModel: ObservableObject {
     private static let performanceAlertsPreferenceKey = "performanceAlertsEnabled"
     private static let thermalThresholdPreferenceKey = "thermalAlertThreshold"
     private static let batteryThresholdPreferenceKey = "batteryAlertThreshold"
-    private static let updateChannelPreferenceKey = "updateChannel"
     private static let setupCompletedPreferenceKey = "setupDoctorCompleted"
     private static let menuItemConfirmedPreferenceKey = "setupDoctorMenuItemConfirmed"
     private static let installerReplacementAuthorizationURL =
@@ -104,10 +102,6 @@ final class CleanroomViewModel: ObservableObject {
         let savedBatteryThreshold = UserDefaults.standard.integer(
             forKey: Self.batteryThresholdPreferenceKey)
         batteryAlertThreshold = savedBatteryThreshold == 0 ? 20 : savedBatteryThreshold
-        updateChannel =
-            CleanroomUpdateChannel(
-                rawValue: UserDefaults.standard.string(forKey: Self.updateChannelPreferenceKey)
-                    ?? "stable") ?? .stable
         setupDoctorVisible = !UserDefaults.standard.bool(forKey: Self.setupCompletedPreferenceKey)
         menuItemConfirmed = UserDefaults.standard.bool(forKey: Self.menuItemConfirmedPreferenceKey)
     }
@@ -118,6 +112,10 @@ final class CleanroomViewModel: ObservableObject {
         case delayed
         case stale
         case unavailable
+    }
+
+    var agentConnected: Bool {
+        status != nil && !connectionMessage.hasPrefix("Agent unavailable:")
     }
 
     var iconName: String {
@@ -153,6 +151,7 @@ final class CleanroomViewModel: ObservableObject {
         guard status != nil else {
             return connectionMessage.hasPrefix("Agent unavailable") ? .unavailable : .connecting
         }
+        guard agentConnected else { return .unavailable }
         guard let heartbeatAt = status?.heartbeatAt else { return .delayed }
         let age = Date().timeIntervalSince(heartbeatAt)
         if age <= 12 { return .healthy }
@@ -180,7 +179,7 @@ final class CleanroomViewModel: ObservableObject {
     var setupDoctorState: SetupDoctorState {
         SetupDoctorState(
             agentRegistered: agentRegistrationReady,
-            xpcConnected: status != nil,
+            xpcConnected: agentConnected,
             menuItemConfirmed: menuItemConfirmed
         )
     }
@@ -580,11 +579,6 @@ final class CleanroomViewModel: ObservableObject {
             thermalAlertThreshold.rawValue, forKey: Self.thermalThresholdPreferenceKey)
         UserDefaults.standard.set(batteryAlertThreshold, forKey: Self.batteryThresholdPreferenceKey)
         pressureAlertGate = SystemPressureAlertGate()
-    }
-
-    func setUpdateChannel(_ channel: CleanroomUpdateChannel) {
-        updateChannel = channel
-        UserDefaults.standard.set(channel.rawValue, forKey: Self.updateChannelPreferenceKey)
     }
 
     func refreshProfiles() async {

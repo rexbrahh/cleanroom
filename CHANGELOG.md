@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.2.3
+
+- Cached status no longer hides an XPC connection failure. Agent commands stay
+  disabled until a live status request succeeds.
+- Settings no longer presents an update-channel control without an updater.
+  It links to the manual release download instead.
+- Menu launch no longer deletes AppKit's private status-item ordering value as
+  if it were a screen coordinate. External menu-bar managers remain in control
+  of their own hide/show policy.
+- Release tags must match `Info.plist` and use a build number greater than the
+  previous tag. Release CI no longer replaces the app build with a smaller
+  workflow run number.
+
 ## 3.2.2
 
 - Restoration now resolves executable symlinks before it compares saved and

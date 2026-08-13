@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.2.4
+
+- Advances the bundle build identity so Homebrew and Nix installs replace
+  earlier internal build-11 agent registrations instead of reusing a stale
+  Service Management helper.
+
 ## 3.2.3
 
 - Cached status no longer hides an XPC connection failure. Agent commands stay

@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.2.2
+
+- Restoration now resolves executable symlinks before it compares saved and
+  running process identities. A slow JankyBorders launch no longer leaves the
+  session degraded when the final process and executable checks succeed.
+
 ## 3.2.0
 
 - Refreshes a changed background-agent registration after a recovery-safe local

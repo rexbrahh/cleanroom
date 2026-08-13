@@ -514,14 +514,12 @@ public actor MacSystemController: CleanroomSystemControlling {
                 continue
             }
             guard profile.policy(for: executableName).disposition == .stop else { continue }
+            let savedState =
+                snapshot.processes.first(where: { $0.executableName == executableName })
+                ?? StoredProcess(executableName: executableName, processIdentifiers: [])
             results.append(
                 applyFailurePolicy(
-                    to: probeResult(
-                        action: "verify restored process",
-                        target: process.name,
-                        actual: await probeProcess(executableName: executableName),
-                        expected: .running
-                    ),
+                    to: await verifyRestoredProcess(process, savedState: savedState),
                     targetIdentifier: executableName,
                     profile: profile
                 )
@@ -1342,8 +1340,8 @@ public actor MacSystemController: CleanroomSystemControlling {
         if current.state == .running {
             let currentPIDs = Set(current.processIdentifiers)
             let originalPIDs = Set(savedState.processIdentifiers)
-            let currentExecutables = Set(current.executableURLs.map(\.standardizedFileURL))
-            let savedExecutables = Set(savedState.executableURLs.map(\.standardizedFileURL))
+            let currentExecutables = canonicalExecutableURLs(current.executableURLs)
+            let savedExecutables = canonicalExecutableURLs(savedState.executableURLs)
             if !savedExecutables.isEmpty, currentExecutables.isDisjoint(with: savedExecutables) {
                 return ActionResult(
                     action: "restore process",
@@ -1376,8 +1374,8 @@ public actor MacSystemController: CleanroomSystemControlling {
         let deadline = Date().addingTimeInterval(4)
         while Date() < deadline {
             let relaunched = await probeProcessIdentity(executableName: process.executableName)
-            let expectedExecutables = Set(savedState.executableURLs.map(\.standardizedFileURL))
-            let actualExecutables = Set(relaunched.executableURLs.map(\.standardizedFileURL))
+            let expectedExecutables = canonicalExecutableURLs(savedState.executableURLs)
+            let actualExecutables = canonicalExecutableURLs(relaunched.executableURLs)
             if relaunched.state == .running,
                 expectedExecutables.isEmpty || !actualExecutables.isDisjoint(with: expectedExecutables)
             {
@@ -1388,8 +1386,45 @@ public actor MacSystemController: CleanroomSystemControlling {
             try? await Task.sleep(for: .milliseconds(150))
         }
         return ActionResult(
-            action: "restore process", target: process.name, outcome: .failed,
-            detail: "Relaunch command ran, but the process did not remain active.")
+            action: "restore process", target: process.name, outcome: .warning,
+            detail:
+                "Relaunch command ran, but the process was not observed during the launch wait; final verification decides completion."
+        )
+    }
+
+    private func verifyRestoredProcess(
+        _ process: ManagedProcess,
+        savedState: StoredProcess
+    ) async -> ActionResult {
+        let current = await probeProcessIdentity(executableName: process.executableName)
+        guard current.state == .running else {
+            return probeResult(
+                action: "verify restored process",
+                target: process.name,
+                actual: current.state,
+                expected: .running
+            )
+        }
+        let expectedExecutables = canonicalExecutableURLs(savedState.executableURLs)
+        let actualExecutables = canonicalExecutableURLs(current.executableURLs)
+        guard expectedExecutables.isEmpty || !actualExecutables.isDisjoint(with: expectedExecutables) else {
+            return ActionResult(
+                action: "verify restored process",
+                target: process.name,
+                outcome: .failed,
+                detail: "A same-named process is running from a different executable than the recovery journal."
+            )
+        }
+        return ActionResult(
+            action: "verify restored process",
+            target: process.name,
+            outcome: .succeeded,
+            detail: "Postcondition and executable provenance verified."
+        )
+    }
+
+    private func canonicalExecutableURLs(_ urls: [URL]) -> Set<URL> {
+        Set(urls.map { $0.resolvingSymlinksInPath().standardizedFileURL })
     }
 
     private func processLoadFindings(profile: CleanroomProfile) async -> [PreflightFinding] {

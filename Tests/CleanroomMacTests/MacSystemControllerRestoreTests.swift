@@ -320,6 +320,69 @@ struct MacSystemControllerRestoreTests {
                     && $0.detail.contains("different executable")
             }
         )
+        #expect(
+            results.contains {
+                $0.action == "verify restored process"
+                    && $0.outcome == .failed
+                    && $0.detail.contains("different executable")
+            }
+        )
+    }
+
+    @Test("a symlink to the saved process executable is accepted")
+    func processExecutableSymlinkIsAccepted() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cleanroom-process-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("borders-real")
+        let symlink = directory.appendingPathComponent("borders")
+        try Data().write(to: executable)
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: executable)
+
+        let process = ManagedProcess(
+            name: "JankyBorders",
+            executableName: "borders",
+            relaunchCommand: [symlink.path]
+        )
+        let profile = CleanroomProfile(
+            name: "test",
+            applications: [],
+            services: [],
+            processes: [process],
+            preferences: []
+        )
+        let snapshot = SystemSnapshot(
+            activeServiceLabels: [],
+            activeApplicationBundleIdentifiers: [],
+            activeProcessNames: [process.executableName],
+            preferences: [],
+            processes: [
+                StoredProcess(
+                    executableName: process.executableName,
+                    processIdentifiers: [321],
+                    executableURLs: [executable]
+                )
+            ]
+        )
+        let controller = MacSystemController(
+            commands: ProcessIdentityCommandRunner(
+                processIdentifier: 999,
+                executablePath: symlink.path
+            ),
+            applications: StoppedApplicationManager()
+        )
+
+        let results = await controller.restore(snapshot: snapshot, profile: profile)
+
+        #expect(!results.contains(where: { $0.outcome.blocksCompletion }))
+        #expect(
+            results.contains {
+                $0.action == "verify restored process"
+                    && $0.outcome == .succeeded
+                    && $0.detail.contains("executable provenance verified")
+            }
+        )
     }
 
     @Test("a running service postcondition wins over a racing bootstrap error")

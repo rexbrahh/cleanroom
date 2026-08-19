@@ -183,6 +183,33 @@ struct CleanroomEngineTests {
         let detected = await engine.reconcile()
         #expect(detected.phase == .active)
         #expect(await trace.count(of: "apply") == 1)
+        let armed = try #require(try await store.loadJournal())
+        #expect(armed.safeLaunchPrepared != true)
+        #expect(armed.trigger.processIdentifier == 42)
+    }
+
+    @Test("Safe Launch does not restore while waiting for Roblox to appear")
+    func safeLaunchDoesNotRestoreBeforeDetection() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace)
+        let system = FakeSystem(trace: trace, triggerState: .stopped)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store,
+            automaticRestoreDebounce: 0
+        )
+
+        let launch = await engine.safeLaunch()
+        #expect(launch.phase == .entering)
+        #expect(await store.journalExists())
+
+        let waiting = await engine.reconcile()
+        #expect(waiting.phase == .entering)
+        #expect(waiting.message.contains("Waiting for Roblox"))
+        #expect(await store.journalExists())
+        #expect(await trace.count(of: "restore") == 0)
+        #expect(await trace.count(of: "apply") == 0)
     }
 
     @Test("failed Safe Launch retains its validated recovery state")
@@ -379,11 +406,35 @@ struct CleanroomEngineTests {
         #expect(events.firstIndex(of: "apply")! < events.firstIndex(of: "preflight")!)
     }
 
-    @Test("failed entry rolls back to the snapshot and clears the journal")
-    func failedEntryRollsBackCleanly() async throws {
+    @Test("failed entry while Roblox is running stays focused and does not restore")
+    func failedEntryWhileTriggerRunningStaysFocused() async throws {
         let trace = Trace()
         let store = MemoryJournalStore(trace: trace)
         let system = FakeSystem(trace: trace, applyFails: true)
+        let engine = CleanroomEngine(
+            profile: .phantomForces(),
+            system: system,
+            journalStore: store
+        )
+
+        let report = await engine.enter()
+
+        #expect(report.phase == .active)
+        #expect(await store.journalExists())
+        #expect(report.message.contains("Desktop state was not restored"))
+        #expect(await trace.count(of: "restore") == 0)
+
+        let automatic = await engine.reconcile()
+        #expect(automatic.phase == .active)
+        #expect(await trace.count(of: "apply") == 1)
+        #expect(await trace.count(of: "restore") == 0)
+    }
+
+    @Test("failed entry rolls back only after Roblox has already exited")
+    func failedEntryRollsBackCleanly() async throws {
+        let trace = Trace()
+        let store = MemoryJournalStore(trace: trace)
+        let system = FakeSystem(trace: trace, applyFails: true, triggerStateAfterApply: .stopped)
         let engine = CleanroomEngine(
             profile: .phantomForces(),
             system: system,
@@ -398,21 +449,22 @@ struct CleanroomEngineTests {
         #expect(events.firstIndex(of: "save-journal")! < events.firstIndex(of: "restore")!)
         #expect(await trace.count(of: "restore") == 1)
 
-        // Automatic re-entry is suppressed until an explicit retry; the monitor
-        // loop must not enter/rollback in a hot loop while Roblox stays open.
         let automatic = await engine.reconcile()
-        #expect(automatic.phase == .degraded)
+        #expect(automatic.phase == .idle)
         #expect(await trace.count(of: "apply") == 1)
-
-        _ = await engine.recover(.retryEntry)
-        #expect(await trace.count(of: "apply") == 2)
+        #expect(await trace.count(of: "restore") == 1)
     }
 
     @Test("failed rollback retains the journal and suppresses automatic entry and restore")
     func failedRollbackSuppressesBothDirections() async throws {
         let trace = Trace()
         let store = MemoryJournalStore(trace: trace)
-        let system = FakeSystem(trace: trace, restoreFails: true, applyFails: true)
+        let system = FakeSystem(
+            trace: trace,
+            restoreFails: true,
+            applyFails: true,
+            triggerStateAfterApply: .stopped
+        )
         let engine = CleanroomEngine(
             profile: .phantomForces(),
             system: system,
@@ -450,7 +502,9 @@ struct CleanroomEngineTests {
         )
 
         let drift = await engine.enforceActive()
-        #expect(drift.phase == .degraded)
+        #expect(drift.phase == .active)
+        #expect(await store.journalExists())
+        #expect(drift.message.contains("Desktop state was not restored"))
 
         await system.setTriggerState(.stopped)
         let report = await engine.reconcile()
@@ -621,26 +675,14 @@ struct CleanroomEngineTests {
         #expect(await trace.count(of: "restore") == 1)
     }
 
-    @Test("failed entry suppression survives an engine restart without a journal")
+    @Test("stale entry suppression is cleared when no recovery journal remains")
     func entrySuppressionSurvivesRestart() async throws {
         let trace = Trace()
         let journalStore = MemoryJournalStore(trace: trace)
-        let preferencesStore = MemoryRuntimePreferencesStore()
-        let system = FakeSystem(trace: trace, applyFails: true)
-        let first = CleanroomEngine(
-            profile: .phantomForces(),
-            system: system,
-            journalStore: journalStore,
-            runtimePreferencesStore: preferencesStore
+        let preferencesStore = MemoryRuntimePreferencesStore(
+            RuntimePreferences(automaticTransitionSuppression: .entry)
         )
-        try await first.loadRuntimePreferences()
-
-        _ = await first.enter()
-        #expect(await trace.count(of: "apply") == 1)
-        #expect(!(await journalStore.journalExists()))
-        #expect((await preferencesStore.current).automaticTransitionSuppression == .entry)
-        #expect((await preferencesStore.current).suppressionSessionIdentifier == nil)
-
+        let system = FakeSystem(trace: trace)
         let restarted = CleanroomEngine(
             profile: .phantomForces(),
             system: system,
@@ -650,8 +692,9 @@ struct CleanroomEngineTests {
         try await restarted.loadRuntimePreferences()
         let automatic = await restarted.reconcile()
 
-        #expect(automatic.phase == .degraded)
+        #expect(automatic.phase == .active)
         #expect(await trace.count(of: "apply") == 1)
+        #expect((await preferencesStore.current).automaticTransitionSuppression == .none)
     }
 
     @Test("successful explicit recovery clears persisted suppression")
@@ -871,6 +914,7 @@ private actor FakeSystem: CleanroomSystemControlling {
     private let alwaysFailVerification: Bool
     private let launchFails: Bool
     private var triggerState: ProbeState
+    private let triggerStateAfterApply: ProbeState?
     private var verificationFailuresRemaining: Int
     private(set) var lastTriggerBundleIdentifier: String?
 
@@ -880,6 +924,7 @@ private actor FakeSystem: CleanroomSystemControlling {
         applyFails: Bool = false,
         alwaysFailVerification: Bool = false,
         triggerState: ProbeState = .running,
+        triggerStateAfterApply: ProbeState? = nil,
         verificationFailsOnce: Bool = false,
         launchFails: Bool = false
     ) {
@@ -888,6 +933,7 @@ private actor FakeSystem: CleanroomSystemControlling {
         self.applyFails = applyFails
         self.alwaysFailVerification = alwaysFailVerification
         self.triggerState = triggerState
+        self.triggerStateAfterApply = triggerStateAfterApply
         self.verificationFailuresRemaining = verificationFailsOnce ? 1 : 0
         self.launchFails = launchFails
     }
@@ -926,6 +972,9 @@ private actor FakeSystem: CleanroomSystemControlling {
 
     func apply(profile: CleanroomProfile) async -> [ActionResult] {
         await trace.append("apply")
+        if let triggerStateAfterApply {
+            triggerState = triggerStateAfterApply
+        }
         if applyFails {
             return [.init(action: "apply", target: profile.name, outcome: .failed, detail: "apply failed")]
         }

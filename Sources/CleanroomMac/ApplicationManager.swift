@@ -110,10 +110,9 @@ public final class WorkspaceApplicationManager: ApplicationManaging {
             _ = application.terminate()
         }
         if await waitUntilStopped(bundleIdentifier: bundleIdentifier, timeout: 1.5) {
-            return ActionResult(
-                action: "stop application",
-                target: displayName,
-                outcome: .succeeded,
+            return await settleStop(
+                bundleIdentifier: bundleIdentifier,
+                displayName: displayName,
                 detail: "Terminated gracefully."
             )
         }
@@ -122,11 +121,47 @@ public final class WorkspaceApplicationManager: ApplicationManaging {
             _ = application.forceTerminate()
         }
         let stopped = await waitUntilStopped(bundleIdentifier: bundleIdentifier, timeout: 1.5)
+        guard stopped else {
+            return ActionResult(
+                action: "stop application",
+                target: displayName,
+                outcome: .failed,
+                detail: "Still running after force termination."
+            )
+        }
+        return await settleStop(
+            bundleIdentifier: bundleIdentifier,
+            displayName: displayName,
+            detail: "Force-terminated after grace period."
+        )
+    }
+
+    private func settleStop(
+        bundleIdentifier: String,
+        displayName: String,
+        detail: String
+    ) async -> ActionResult {
+        try? await Task.sleep(for: .milliseconds(400))
+        let relaunched = runningApplications(bundleIdentifier: bundleIdentifier)
+        guard !relaunched.isEmpty else {
+            return ActionResult(
+                action: "stop application",
+                target: displayName,
+                outcome: .succeeded,
+                detail: detail
+            )
+        }
+        for application in relaunched {
+            _ = application.forceTerminate()
+        }
+        let stopped = await waitUntilStopped(bundleIdentifier: bundleIdentifier, timeout: 1.2)
         return ActionResult(
             action: "stop application",
             target: displayName,
             outcome: stopped ? .succeeded : .failed,
-            detail: stopped ? "Force-terminated after grace period." : "Still running after force termination."
+            detail: stopped
+                ? "Terminated, then force-killed a keep-alive relaunch."
+                : "Relaunched and still running after force termination."
         )
     }
 

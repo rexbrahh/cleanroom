@@ -5,6 +5,11 @@
 - Advances the bundle build identity so Homebrew and Nix installs replace
   earlier internal build-11 agent registrations instead of reusing a stale
   Service Management helper.
+- Removes Raycast from the Phantom Forces quit list so restore no longer
+  relaunches it. Build 13 forces a helper replacement after that change.
+- Build 14 is a helper replacement for menu-bar warning diagnostics.
+- Recycles an enabled-but-silent helper after a bundle digest change and
+  waits until XPC answers, instead of asking for Login Items surgery.
 
 ## 3.2.3
 

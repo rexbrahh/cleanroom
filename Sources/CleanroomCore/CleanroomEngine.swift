@@ -41,6 +41,9 @@ public actor CleanroomEngine {
     /// debounced.
     private let baseAutomaticRestoreDebounce: TimeInterval
     private var automaticRestoreDebounce: TimeInterval
+    /// Safe Launch writes a journal before Roblox exists. Wait this long for
+    /// the player to appear before treating that journal as an ended session.
+    private let safeLaunchAppearanceTimeout: TimeInterval = 60
 
     public init(
         profile: CleanroomProfile,
@@ -122,6 +125,15 @@ public actor CleanroomEngine {
                 suppressionSessionIdentifier = nil
                 try await persistRuntimePreferences()
             }
+        }
+        // A completed rollback used to latch .entry while Roblox stayed open.
+        // That blocked the next real launch. With no journal there is nothing
+        // left to protect; drop stale entry suppression so the next session
+        // can enter normally.
+        if suppression == .entry, try await journalStore.loadJournal() == nil {
+            suppression = .none
+            suppressionSessionIdentifier = nil
+            try await persistRuntimePreferences()
         }
         phase = paused ? .paused : .idle
     }
@@ -373,17 +385,31 @@ public actor CleanroomEngine {
         }
 
         if paused {
-            if await journalStore.journalExists() {
-                switch trigger.state {
-                case .stopped:
-                    return await automaticRestore()
-                case .unknown:
-                    triggerStoppedSince = nil
-                    return await degrade(trigger.detail ?? "Roblox process state is unknown during a paused session.")
-                case .running:
-                    triggerStoppedSince = nil
-                    break
+            do {
+                if let journal = try await journalStore.loadJournal() {
+                    switch trigger.state {
+                    case .stopped:
+                        if isSafeLaunchPending(journal),
+                            now().timeIntervalSince(journal.createdAt) < safeLaunchAppearanceTimeout
+                        {
+                            triggerStoppedSince = nil
+                            phase = .paused
+                            lastMessage =
+                                "Automatic entry is paused; waiting for Roblox after Safe Launch before restoring."
+                            lastResults = []
+                            return TransitionReport(phase: .paused, message: lastMessage)
+                        }
+                        return await automaticRestore()
+                    case .unknown:
+                        triggerStoppedSince = nil
+                        return await degrade(
+                            trigger.detail ?? "Roblox process state is unknown during a paused session.")
+                    case .running:
+                        triggerStoppedSince = nil
+                    }
                 }
+            } catch {
+                return await degrade(error.localizedDescription)
             }
             phase = .paused
             lastMessage = "Automatic entry and drift repair are paused; saved restoration remains armed."
@@ -405,7 +431,27 @@ public actor CleanroomEngine {
             }
             return await enter(trigger: trigger, force: false)
         case .stopped:
-            if await journalStore.journalExists() {
+            let journal: RecoveryJournal?
+            do {
+                journal = try await journalStore.loadJournal()
+            } catch {
+                return await degrade(error.localizedDescription)
+            }
+            if let journal {
+                if isSafeLaunchPending(journal) {
+                    let waited = now().timeIntervalSince(journal.createdAt)
+                    if waited < safeLaunchAppearanceTimeout {
+                        triggerStoppedSince = nil
+                        phase = .entering
+                        lastMessage = "Waiting for Roblox after Safe Launch."
+                        return TransitionReport(
+                            phase: phase,
+                            message: lastMessage,
+                            results: lastResults,
+                            preflight: latestPreflight
+                        )
+                    }
+                }
                 return await automaticRestore()
             }
             triggerStoppedSince = nil
@@ -480,6 +526,9 @@ public actor CleanroomEngine {
                 phase: .paused,
                 message: "Resume automatic control before using Safe Launch."
             )
+        }
+        guard await clearSuppressionForExplicitRecovery() else {
+            return await degrade("Retry suppression could not be cleared; Safe Launch was not attempted.")
         }
         let trigger = await system.probeTrigger(bundleIdentifier: profile.triggerBundleIdentifier)
         guard trigger.state == .stopped else {
@@ -651,11 +700,21 @@ public actor CleanroomEngine {
         var results = await system.apply(profile: profile)
         results.append(contentsOf: await system.verifyApplied(profile: profile))
         if results.contains(where: { $0.outcome.blocksCompletion }) {
-            return await degrade(
-                "Cleanroom drift repair failed; automatic retries are paused and recovery state was retained.",
-                results: results,
-                suppressing: .entry
+            let triggerAfterRepair = await system.probeTrigger(
+                bundleIdentifier: profile.triggerBundleIdentifier
             )
+            if triggerAfterRepair.state != .stopped {
+                phase = .active
+                lastMessage = stayFocusedMessage(results)
+                lastResults = results
+                return TransitionReport(
+                    phase: phase,
+                    message: lastMessage,
+                    results: results,
+                    preflight: latestPreflight
+                )
+            }
+            return await automaticRestore()
         }
 
         phase = .active
@@ -734,10 +793,18 @@ public actor CleanroomEngine {
         if existingJournal != nil, phase == .active, !force {
             return TransitionReport(
                 phase: .active,
-                message: "Roblox cleanroom remains active.",
+                message: lastMessage.isEmpty ? "Roblox cleanroom remains active." : lastMessage,
                 results: lastResults,
                 preflight: latestPreflight
             )
+        }
+
+        if let existingJournal {
+            do {
+                try await armSafeLaunchJournalIfNeeded(existingJournal, process: process)
+            } catch {
+                return await degrade(error.localizedDescription, suppressing: .entry)
+            }
         }
 
         // Only profiles that gate entry on preflight pay its cost up front.
@@ -802,21 +869,41 @@ public actor CleanroomEngine {
     }
 
     /// Entry failed after the journal was saved and some mutations were
-    /// applied. Roll back to the snapshot so the user is never stranded with
-    /// helpers stopped while Roblox is unplayable.
+    /// applied.
     ///
-    /// - Clean rollback: journal cleared, phase `idle`, and automatic entry is
-    ///   suppressed until an explicit retry (otherwise the monitor loop would
-    ///   re-enter and fail again every second).
-    /// - Failed rollback: journal retained and both directions are suppressed;
-    ///   the on-disk state is uncertain, so only explicit recovery actions may
-    ///   proceed.
+    /// If Roblox is still running, stay in the focused session. Restoring the
+    /// desktop while the game is up is worse than a leftover helper; drift
+    /// repair keeps retrying the stragglers.
+    ///
+    /// If Roblox is already gone, roll back to the snapshot. A clean rollback
+    /// clears the journal. A failed rollback retains it and suppresses both
+    /// directions because the on-disk state is uncertain.
     private func rollbackFailedEntry(results: [ActionResult]) async -> TransitionReport {
         let journal: RecoveryJournal?
         do {
             journal = try await journalStore.loadJournal()
         } catch {
             return await degrade(error.localizedDescription, results: results, suppressing: .all)
+        }
+
+        let trigger = await system.probeTrigger(bundleIdentifier: profile.triggerBundleIdentifier)
+        if trigger.state != .stopped {
+            guard journal != nil else {
+                return await degrade(
+                    "Cleanroom entry failed after recovery state disappeared; automatic transitions are paused.",
+                    results: results,
+                    suppressing: .all
+                )
+            }
+            phase = .active
+            lastMessage = stayFocusedMessage(results)
+            lastResults = results
+            return TransitionReport(
+                phase: phase,
+                message: lastMessage,
+                results: results,
+                preflight: latestPreflight
+            )
         }
 
         guard let journal else {
@@ -844,19 +931,8 @@ public actor CleanroomEngine {
         }
 
         phase = .idle
-        do {
-            try await updateSuppression(.entry, sessionIdentifier: nil)
-        } catch {
-            lastMessage =
-                "Cleanroom entry failed and the pre-entry state was restored, but retry suppression could not be saved: \(error.localizedDescription)"
-            lastResults = combined
-            return TransitionReport(
-                phase: .degraded,
-                message: lastMessage,
-                results: combined,
-                preflight: latestPreflight
-            )
-        }
+        await clearSuppressionAfterSuccess()
+        triggerStoppedSince = nil
         lastMessage = "Cleanroom entry failed; the pre-entry state was restored automatically."
         lastResults = combined
         return TransitionReport(
@@ -948,6 +1024,40 @@ public actor CleanroomEngine {
         let identifier = journal.profileIdentifier ?? "roblox-phantom-forces"
         return identifier == profile.identifier
             && journal.trigger.bundleIdentifier == profile.triggerBundleIdentifier
+    }
+
+    private func isSafeLaunchPending(_ journal: RecoveryJournal) -> Bool {
+        journal.safeLaunchPrepared == true && journal.trigger.processIdentifier == 0
+    }
+
+    private func armSafeLaunchJournalIfNeeded(
+        _ journal: RecoveryJournal,
+        process: TriggerProcess
+    ) async throws {
+        guard isSafeLaunchPending(journal) else { return }
+        let armed = RecoveryJournal(
+            schemaVersion: journal.schemaVersion,
+            sessionIdentifier: journal.sessionIdentifier,
+            createdAt: journal.createdAt,
+            trigger: process,
+            snapshot: journal.snapshot,
+            safeLaunchPrepared: false,
+            profileIdentifier: journal.profileIdentifier ?? profile.identifier
+        )
+        try await journalStore.saveJournal(armed)
+    }
+
+    private func stayFocusedMessage(_ results: [ActionResult]) -> String {
+        let targets = Array(
+            Set(results.filter { $0.outcome.blocksCompletion }.map(\.target))
+        ).sorted()
+        if targets.isEmpty {
+            return
+                "Competitive mode is active; some postconditions failed, but Roblox is running so desktop state was not restored."
+        }
+        let listed = targets.prefix(5).joined(separator: ", ")
+        return
+            "Competitive mode is active; \(listed) did not stay stopped. Desktop state was not restored."
     }
 
     private func beginTransition(_ transition: TransitionKind) -> Bool {

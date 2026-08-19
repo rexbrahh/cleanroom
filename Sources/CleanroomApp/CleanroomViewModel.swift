@@ -10,7 +10,7 @@ import ServiceManagement
 import UniformTypeIdentifiers
 @preconcurrency import UserNotifications
 
-enum AgentLivenessRepairTrigger {
+enum AgentLivenessRepairTrigger: Equatable {
     case automaticFailure
     case installerAuthorizedReplacement
     case userRequestedReplacement
@@ -241,9 +241,19 @@ final class CleanroomViewModel: ObservableObject {
         logger.notice("View model started; refreshing registration state")
         Task { [weak self] in
             guard let self else { return }
+            let replaceAgent = CommandLine.arguments.contains("--replace-agent")
+            let digest = currentRegistrationDigest()
+            let registeredDigest = UserDefaults.standard.string(forKey: "registeredAgentDigest")
             await refreshAgentRegistration(
-                trigger: installerReplacementIsAuthorized()
-                    ? .installerAuthorizedReplacement : .automaticFailure
+                force: replaceAgent,
+                trigger: Self.launchRegistrationTrigger(
+                    userRequestedReplacement: replaceAgent,
+                    installerMarkerAuthorized: installerReplacementIsAuthorized(),
+                    digestChanged: digest != nil && digest != registeredDigest,
+                    recoveryJournalExists: FileManager.default.fileExists(
+                        atPath: FileRecoveryJournalStore().journalURL.path
+                    )
+                )
             )
             await refreshProfiles()
             await refreshCalibration()
@@ -279,59 +289,82 @@ final class CleanroomViewModel: ObservableObject {
         let service = SMAppService.agent(plistName: "com.rex.cleanroom.agent.plist")
         let digest = currentRegistrationDigest()
         let registeredDigest = UserDefaults.standard.string(forKey: "registeredAgentDigest")
-        do {
-            switch service.status {
-            case .enabled:
-                if trigger.permitsDestructiveReplacement {
-                    agentRegistrationReady = false
-                    registrationMessage = "Refreshing background-agent registration…"
-                    // Boot the old job out first: a job bound to a replaced
-                    // bundle can survive unregister/register and keep
-                    // crash-looping on its unresolvable program path.
-                    _ = await LocalCommandRunner().run(
-                        "/bin/launchctl",
-                        arguments: ["bootout", "gui/\(getuid())/com.rex.cleanroom.agent"],
-                        timeout: 5
-                    )
-                    try await service.unregister()
-                    try await Task.sleep(for: .seconds(1))
-                    try service.register()
-                    lastRegistrationRepairAt = Date()
-                    if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
-                    registrationMessage = "Background agent updated and enabled"
-                    agentRegistrationReady = true
-                } else if digest == nil || registeredDigest != digest {
-                    registrationMessage =
-                        "Agent bundle changed; use Replace Agent Registration when no transition is running"
-                    agentRegistrationReady = false
-                } else {
-                    registrationMessage =
-                        force
-                        ? "Background agent is registered; connection recovery is pending"
-                        : "Background agent enabled"
-                    agentRegistrationReady = true
-                }
-            case .requiresApproval:
-                registrationMessage = "Background agent requires approval in Login Items"
-                agentRegistrationReady = false
-            case .notRegistered, .notFound:
-                try service.register()
-                lastRegistrationRepairAt = Date()
-                if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
+        let digestChanged = digest != nil && digest != registeredDigest
+        let journalExists = FileManager.default.fileExists(
+            atPath: FileRecoveryJournalStore().journalURL.path
+        )
+        switch service.status {
+        case .enabled:
+            if Self.shouldReplaceEnabledAgent(
+                triggerPermitsDestructiveReplacement: trigger.permitsDestructiveReplacement,
+                digestChanged: digestChanged,
+                recoveryJournalExists: journalExists
+            ) {
+                await replaceEnabledAgent(service: service, digest: digest)
+            } else if digestChanged {
                 registrationMessage =
-                    service.status == .requiresApproval
-                    ? "Background agent requires approval in Login Items"
-                    : "Background agent registered"
-                agentRegistrationReady = service.status == .enabled
-            @unknown default:
-                registrationMessage = "Background-agent status is unknown"
-                agentRegistrationReady = false
+                    "Background agent update is waiting until the current session is restored"
+                agentRegistrationReady = true
+            } else {
+                registrationMessage =
+                    force
+                    ? "Background agent is registered; connection recovery is pending"
+                    : "Background agent enabled"
+                agentRegistrationReady = true
             }
-        } catch {
-            registrationMessage = "Agent registration failed: \(error.localizedDescription)"
+        case .requiresApproval:
+            registrationMessage = "Background agent requires approval in Login Items"
             agentRegistrationReady = false
-            logger.error("Agent registration failed: \(error.localizedDescription, privacy: .public)")
+        case .notRegistered, .notFound:
+            await replaceEnabledAgent(service: service, digest: digest)
+        @unknown default:
+            registrationMessage = "Background-agent status is unknown"
+            agentRegistrationReady = false
         }
+    }
+
+    /// Unregister while SMAppService still reports `.enabled`, then register and
+    /// wait until XPC answers. launchd EX_CONFIG (78) means the job is enabled
+    /// but cannot spawn the new CDHash; bootout-first leaves that LWCR stale.
+    private func replaceEnabledAgent(service: SMAppService, digest: String?) async {
+        agentRegistrationReady = false
+        registrationMessage = "Refreshing background-agent registration…"
+        for attempt in 1...2 {
+            do {
+                try await service.unregister()
+            } catch {
+                logger.error(
+                    "Agent unregister before recycle failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            try? await Task.sleep(for: .seconds(1))
+            do {
+                try service.register()
+            } catch {
+                registrationMessage = "Agent registration failed: \(error.localizedDescription)"
+                logger.error("Agent registration failed: \(error.localizedDescription, privacy: .public)")
+                continue
+            }
+            lastRegistrationRepairAt = Date()
+            if await waitUntilAgentAnswers(timeout: 8) {
+                if let digest { UserDefaults.standard.set(digest, forKey: "registeredAgentDigest") }
+                registrationMessage = "Background agent updated and enabled"
+                agentRegistrationReady = true
+                return
+            }
+        }
+        registrationMessage =
+            "Background agent is registered but not answering; use Replace Agent Registration"
+        agentRegistrationReady = false
+    }
+
+    private func waitUntilAgentAnswers(timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await probeAgent() { return true }
+            try? await Task.sleep(for: .milliseconds(400))
+        }
+        return await probeAgent()
     }
 
     nonisolated static func installerReplacementIsAuthorized(
@@ -339,6 +372,39 @@ final class CleanroomViewModel: ObservableObject {
         currentBuild: String
     ) -> Bool {
         markerBuild?.trimmingCharacters(in: .whitespacesAndNewlines) == currentBuild
+    }
+
+    nonisolated static func launchRegistrationTrigger(
+        userRequestedReplacement: Bool,
+        installerMarkerAuthorized: Bool,
+        digestChanged: Bool,
+        recoveryJournalExists: Bool
+    ) -> AgentLivenessRepairTrigger {
+        if userRequestedReplacement { return .userRequestedReplacement }
+        if installerMarkerAuthorized { return .installerAuthorizedReplacement }
+        if digestChanged && !recoveryJournalExists { return .installerAuthorizedReplacement }
+        return .automaticFailure
+    }
+
+    nonisolated static func shouldReplaceEnabledAgent(
+        triggerPermitsDestructiveReplacement: Bool,
+        digestChanged: Bool,
+        recoveryJournalExists: Bool
+    ) -> Bool {
+        if triggerPermitsDestructiveReplacement { return true }
+        return digestChanged && !recoveryJournalExists
+    }
+
+    nonisolated static func shouldClearInstallerReplacementAuthorization(
+        agentBuild: CleanroomBuildIdentity?,
+        currentBuild: CleanroomBuildIdentity,
+        markerBuild: String?
+    ) -> Bool {
+        agentBuild == currentBuild
+            && installerReplacementIsAuthorized(
+                markerBuild: markerBuild,
+                currentBuild: currentBuild.build
+            )
     }
 
     nonisolated static func shouldAttemptAutomaticLivenessRepair(
@@ -400,7 +466,14 @@ final class CleanroomViewModel: ObservableObject {
             if self.status != status {
                 self.status = status
             }
-            if response.agentBuild == CleanroomBuildIdentity.current {
+            if Self.shouldClearInstallerReplacementAuthorization(
+                agentBuild: response.agentBuild,
+                currentBuild: CleanroomBuildIdentity.current,
+                markerBuild: try? String(
+                    contentsOf: Self.installerReplacementAuthorizationURL,
+                    encoding: .utf8
+                )
+            ) {
                 clearInstallerReplacementAuthorization()
             }
             let resolvedPreflight = status.preflight ?? preflight
@@ -440,9 +513,8 @@ final class CleanroomViewModel: ObservableObject {
         }
     }
 
-    /// Automatic repair is deliberately non-destructive: kickstart can revive
-    /// an unloaded job without terminating a live transition. Replacement is
-    /// reserved for the explicit UI action.
+    /// Kickstart first. EX_CONFIG jobs stay silent after kickstart, so recycle
+    /// SMAppService when no recovery journal is protecting live state.
     private func repairAgentLiveness() async {
         _ = await LocalCommandRunner().run(
             "/bin/launchctl",
@@ -453,9 +525,19 @@ final class CleanroomViewModel: ObservableObject {
             logger.notice("Agent answered after kickstart; no re-registration needed")
             return
         }
-        registrationMessage =
-            "Agent unreachable after non-destructive repair; replace its registration only when no transition is running"
-        logger.error("Agent still unreachable after non-destructive kickstart")
+        let journalExists = FileManager.default.fileExists(
+            atPath: FileRecoveryJournalStore().journalURL.path
+        )
+        if journalExists {
+            registrationMessage =
+                "Agent unreachable after non-destructive repair; replace its registration only when no transition is running"
+            logger.error("Agent still unreachable after non-destructive kickstart")
+            return
+        }
+        await refreshAgentRegistration(
+            force: true,
+            trigger: .installerAuthorizedReplacement
+        )
     }
 
     private func probeAgent() async -> Bool {

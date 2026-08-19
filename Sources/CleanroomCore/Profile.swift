@@ -98,7 +98,6 @@ public struct CleanroomProfile: Codable, Equatable, Sendable {
                 .init(
                     name: "superwhisper", bundleIdentifier: "com.superduper.superwhisper",
                     executableName: "superwhisper"),
-                .init(name: "Raycast", bundleIdentifier: "com.raycast.macos", executableName: "Raycast"),
                 .init(name: "Alfred", bundleIdentifier: "com.runningwithcrayons.Alfred", executableName: "Alfred"),
                 .init(name: "CleanShot X", bundleIdentifier: "pl.maketheweb.cleanshotx", executableName: "CleanShot X"),
                 .init(

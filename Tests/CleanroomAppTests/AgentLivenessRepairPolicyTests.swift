@@ -32,6 +32,40 @@ struct AgentLivenessRepairPolicyTests {
         #expect(AgentLivenessRepairTrigger.userRequestedReplacement.permitsDestructiveReplacement)
     }
 
+    @Test("digest change without a journal authorizes helper replacement")
+    func digestChangeReplacesWhenIdle() {
+        #expect(
+            CleanroomViewModel.launchRegistrationTrigger(
+                userRequestedReplacement: false,
+                installerMarkerAuthorized: false,
+                digestChanged: true,
+                recoveryJournalExists: false
+            ) == .installerAuthorizedReplacement
+        )
+        #expect(
+            CleanroomViewModel.shouldReplaceEnabledAgent(
+                triggerPermitsDestructiveReplacement: false,
+                digestChanged: true,
+                recoveryJournalExists: false
+            )
+        )
+        #expect(
+            CleanroomViewModel.launchRegistrationTrigger(
+                userRequestedReplacement: false,
+                installerMarkerAuthorized: false,
+                digestChanged: true,
+                recoveryJournalExists: true
+            ) == .automaticFailure
+        )
+        #expect(
+            !CleanroomViewModel.shouldReplaceEnabledAgent(
+                triggerPermitsDestructiveReplacement: false,
+                digestChanged: true,
+                recoveryJournalExists: true
+            )
+        )
+    }
+
     @Test("installer authorization is scoped to the installed build")
     func installerAuthorizationMatchesBuild() {
         #expect(
@@ -44,6 +78,26 @@ struct AgentLivenessRepairPolicyTests {
             !CleanroomViewModel.installerReplacementIsAuthorized(
                 markerBuild: "6",
                 currentBuild: "8"
+            )
+        )
+    }
+
+    @Test("status polling does not consume a newer installer's replacement marker")
+    func staleMenuAppDoesNotClearNewerReplacementMarker() {
+        let build12 = CleanroomBuildIdentity(version: "3.2.4", build: "12")
+        let build13 = CleanroomBuildIdentity(version: "3.2.4", build: "13")
+        #expect(
+            !CleanroomViewModel.shouldClearInstallerReplacementAuthorization(
+                agentBuild: build12,
+                currentBuild: build12,
+                markerBuild: "13\n"
+            )
+        )
+        #expect(
+            CleanroomViewModel.shouldClearInstallerReplacementAuthorization(
+                agentBuild: build13,
+                currentBuild: build13,
+                markerBuild: "13\n"
             )
         )
     }

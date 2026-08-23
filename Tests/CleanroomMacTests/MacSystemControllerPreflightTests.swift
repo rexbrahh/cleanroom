@@ -10,7 +10,8 @@ struct MacSystemControllerPreflightTests {
     func failedProbesCannotReportReady() async {
         let controller = MacSystemController(
             commands: FailedPreflightCommandRunner(),
-            applications: PreflightApplicationManager()
+            applications: PreflightApplicationManager(),
+            trackpad: UnknownPointerTrackpadController()
         )
         let profile = CleanroomProfile(
             name: "test",
@@ -98,6 +99,36 @@ private actor FailedPreflightCommandRunner: CommandRunning {
             arguments: arguments,
             exitCode: exitCode,
             standardError: error
+        )
+    }
+}
+
+private actor UnknownPointerTrackpadController: BuiltInTrackpadControlling {
+    func observe() -> BuiltInTrackpadObservation {
+        BuiltInTrackpadObservation(
+            lid: .unknown,
+            externalPointer: .unknown,
+            builtInTrackpadPresent: true,
+            currentlySuppressed: false,
+            listenEventAccessGranted: false
+        )
+    }
+
+    func suppress() -> ActionResult {
+        ActionResult(
+            action: "suppress built-in trackpad",
+            target: "built-in-trackpad",
+            outcome: .warning,
+            detail: "unused"
+        )
+    }
+
+    func restore() -> ActionResult {
+        ActionResult(
+            action: "restore built-in trackpad",
+            target: "built-in-trackpad",
+            outcome: .skipped,
+            detail: "unused"
         )
     }
 }

@@ -47,6 +47,7 @@ public struct CleanroomProfile: Codable, Equatable, Sendable {
     public let processCPUCriticalPercent: Double
     public let blockAutomaticEntryOnCriticalPreflight: Bool
     public let targetPolicies: [TargetPolicy]
+    public let suppressBuiltInTrackpadWhenLidOpen: Bool
 
     public init(
         identifier: String = "custom",
@@ -59,7 +60,8 @@ public struct CleanroomProfile: Codable, Equatable, Sendable {
         processCPUWarningPercent: Double = 20,
         processCPUCriticalPercent: Double = 50,
         blockAutomaticEntryOnCriticalPreflight: Bool = false,
-        targetPolicies: [TargetPolicy] = []
+        targetPolicies: [TargetPolicy] = [],
+        suppressBuiltInTrackpadWhenLidOpen: Bool = true
     ) {
         self.identifier = identifier
         self.name = name
@@ -72,6 +74,7 @@ public struct CleanroomProfile: Codable, Equatable, Sendable {
         self.processCPUCriticalPercent = processCPUCriticalPercent
         self.blockAutomaticEntryOnCriticalPreflight = blockAutomaticEntryOnCriticalPreflight
         self.targetPolicies = targetPolicies
+        self.suppressBuiltInTrackpadWhenLidOpen = suppressBuiltInTrackpadWhenLidOpen
     }
 
     public static func phantomForces(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> Self {
@@ -184,12 +187,62 @@ public struct CleanroomProfile: Codable, Equatable, Sendable {
             processCPUWarningPercent: base.processCPUWarningPercent,
             processCPUCriticalPercent: base.processCPUCriticalPercent,
             blockAutomaticEntryOnCriticalPreflight: base.blockAutomaticEntryOnCriticalPreflight,
-            targetPolicies: base.targetPolicies
+            targetPolicies: base.targetPolicies,
+            suppressBuiltInTrackpadWhenLidOpen: base.suppressBuiltInTrackpadWhenLidOpen
         )
     }
 
     public static func builtIn(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> [Self] {
         [phantomForces(homeDirectory: homeDirectory), minecraft(homeDirectory: homeDirectory)]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case identifier
+        case name
+        case triggerBundleIdentifier
+        case applications
+        case services
+        case processes
+        case preferences
+        case processCPUWarningPercent
+        case processCPUCriticalPercent
+        case blockAutomaticEntryOnCriticalPreflight
+        case targetPolicies
+        case suppressBuiltInTrackpadWhenLidOpen
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        identifier = try container.decode(String.self, forKey: .identifier)
+        name = try container.decode(String.self, forKey: .name)
+        triggerBundleIdentifier = try container.decode(String.self, forKey: .triggerBundleIdentifier)
+        applications = try container.decode([ManagedApplication].self, forKey: .applications)
+        services = try container.decode([ManagedService].self, forKey: .services)
+        processes = try container.decode([ManagedProcess].self, forKey: .processes)
+        preferences = try container.decode([PreferenceAction].self, forKey: .preferences)
+        processCPUWarningPercent = try container.decode(Double.self, forKey: .processCPUWarningPercent)
+        processCPUCriticalPercent = try container.decode(Double.self, forKey: .processCPUCriticalPercent)
+        blockAutomaticEntryOnCriticalPreflight = try container.decode(
+            Bool.self, forKey: .blockAutomaticEntryOnCriticalPreflight)
+        targetPolicies = try container.decode([TargetPolicy].self, forKey: .targetPolicies)
+        suppressBuiltInTrackpadWhenLidOpen =
+            try container.decodeIfPresent(Bool.self, forKey: .suppressBuiltInTrackpadWhenLidOpen) ?? true
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(identifier, forKey: .identifier)
+        try container.encode(name, forKey: .name)
+        try container.encode(triggerBundleIdentifier, forKey: .triggerBundleIdentifier)
+        try container.encode(applications, forKey: .applications)
+        try container.encode(services, forKey: .services)
+        try container.encode(processes, forKey: .processes)
+        try container.encode(preferences, forKey: .preferences)
+        try container.encode(processCPUWarningPercent, forKey: .processCPUWarningPercent)
+        try container.encode(processCPUCriticalPercent, forKey: .processCPUCriticalPercent)
+        try container.encode(blockAutomaticEntryOnCriticalPreflight, forKey: .blockAutomaticEntryOnCriticalPreflight)
+        try container.encode(targetPolicies, forKey: .targetPolicies)
+        try container.encode(suppressBuiltInTrackpadWhenLidOpen, forKey: .suppressBuiltInTrackpadWhenLidOpen)
     }
 }
 
@@ -267,7 +320,8 @@ extension CleanroomProfile {
             processCPUWarningPercent: processCPUWarningPercent,
             processCPUCriticalPercent: processCPUCriticalPercent,
             blockAutomaticEntryOnCriticalPreflight: blockAutomaticEntryOnCriticalPreflight,
-            targetPolicies: targetPolicies
+            targetPolicies: targetPolicies,
+            suppressBuiltInTrackpadWhenLidOpen: suppressBuiltInTrackpadWhenLidOpen
         )
     }
 
@@ -298,6 +352,14 @@ extension CleanroomProfile {
                     detail: $0.activeValue
                 )
             }
+            + (suppressBuiltInTrackpadWhenLidOpen
+                ? [
+                    ProfileMutationPreview(
+                        action: "suppress built-in trackpad",
+                        target: "built-in-trackpad",
+                        detail: "When the lid is open and an external pointer is present"
+                    )
+                ] : [])
         var errors: [String] = []
         if identifier.isEmpty || name.isEmpty || triggerBundleIdentifier.isEmpty {
             errors.append("Profile identifier, name, and trigger bundle ID are required.")

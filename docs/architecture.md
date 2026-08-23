@@ -58,6 +58,8 @@ are never debounced.
 The fixed Phantom Forces profile snapshots and temporarily changes:
 
 - mouse linearity, external-mouse trackpad gating, and the bottom-right hot corner;
+- the built-in trackpad, seized only when the lid is open and an external pointer
+  is present, then released when Roblox quits;
 - `skhd`, `yabai`, and JankyBorders;
 - the configured input, window, launcher, capture, overlay, and background apps.
 

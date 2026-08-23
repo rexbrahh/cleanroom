@@ -46,5 +46,6 @@ struct DeviceCalibrationTests {
         #expect(
             profile.preferences.first { $0.key == "USBMouseStopsTrackpad" }?.activeValue == "true"
         )
+        #expect(profile.suppressBuiltInTrackpadWhenLidOpen)
     }
 }

@@ -637,6 +637,12 @@ private struct DashboardView: View {
                             icon: "app"
                         )
                     }
+                    policyRow(
+                        name: "Built-in trackpad",
+                        detail:
+                            "Disabled when the lid is open and an external pointer is present; restored when Roblox quits",
+                        icon: "hand.draw"
+                    )
                     ForEach(profile.services) { service in
                         policyRow(name: service.name, detail: service.label, icon: "rectangle.stack.badge.minus")
                     }

@@ -67,6 +67,7 @@ final class CleanroomViewModel: ObservableObject {
     private let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
     private var pollingTask: Task<Void, Never>?
     private var started = false
+    private var didRequestInputMonitoring = false
     private var registrationInProgress = false
     private var lastRegistrationRepairAt = Date.distantPast
     private var statusPollCount = 0
@@ -196,7 +197,8 @@ final class CleanroomViewModel: ObservableObject {
             preferences: template.preferences,
             processCPUWarningPercent: template.processCPUWarningPercent,
             processCPUCriticalPercent: template.processCPUCriticalPercent,
-            blockAutomaticEntryOnCriticalPreflight: template.blockAutomaticEntryOnCriticalPreflight
+            blockAutomaticEntryOnCriticalPreflight: template.blockAutomaticEntryOnCriticalPreflight,
+            suppressBuiltInTrackpadWhenLidOpen: template.suppressBuiltInTrackpadWhenLidOpen
         )
     }
 
@@ -329,9 +331,9 @@ final class CleanroomViewModel: ObservableObject {
     private func replaceEnabledAgent(service: SMAppService, digest: String?) async {
         agentRegistrationReady = false
         registrationMessage = "Refreshing background-agent registration…"
-        for attempt in 1...2 {
+        for _ in 1...2 {
             do {
-                try await service.unregister()
+                try await Self.unregisterLaunchAgent()
             } catch {
                 logger.error(
                     "Agent unregister before recycle failed: \(error.localizedDescription, privacy: .public)"
@@ -356,6 +358,14 @@ final class CleanroomViewModel: ObservableObject {
         registrationMessage =
             "Background agent is registered but not answering; use Replace Agent Registration"
         agentRegistrationReady = false
+    }
+
+    nonisolated private static func unregisterLaunchAgent() async throws {
+        try await SMAppService.agent(plistName: "com.rex.cleanroom.agent.plist").unregister()
+    }
+
+    nonisolated private static func unregisterMainApp() async throws {
+        try await SMAppService.mainApp.unregister()
     }
 
     private func waitUntilAgentAnswers(timeout: TimeInterval) async -> Bool {
@@ -480,6 +490,7 @@ final class CleanroomViewModel: ObservableObject {
             if self.preflight != resolvedPreflight {
                 self.preflight = resolvedPreflight
             }
+            requestInputMonitoringIfNeeded(from: resolvedPreflight)
             if connectionMessage != status.lastMessage {
                 connectionMessage = status.lastMessage
             }
@@ -848,11 +859,11 @@ final class CleanroomViewModel: ObservableObject {
                     // Unregister first: a stale login-item registration can be
                     // bound to an old app location (e.g. a dist/ build), which
                     // silently keeps launch-at-login pointed at the wrong copy.
-                    try? await SMAppService.mainApp.unregister()
+                    try? await Self.unregisterMainApp()
                     try SMAppService.mainApp.register()
                     logger.notice("Menu-app login item registered from \(Bundle.main.bundleURL.path, privacy: .public)")
                 } else {
-                    try await SMAppService.mainApp.unregister()
+                    try await Self.unregisterMainApp()
                 }
                 refreshLaunchAtLoginStatus()
             } catch {
@@ -944,6 +955,7 @@ final class CleanroomViewModel: ObservableObject {
                 case .preflight(let report):
                     preflight = report
                     connectionMessage = "Competitive preflight completed."
+                    requestInputMonitoringIfNeeded(from: report)
                 case .events(let events):
                     recentEvents = events.reversed()
                 case .performanceTimeline(let records):
@@ -986,6 +998,13 @@ final class CleanroomViewModel: ObservableObject {
                 await client.invalidate()
             }
         }
+    }
+
+    private func requestInputMonitoringIfNeeded(from report: PreflightReport?) {
+        guard let report, !didRequestInputMonitoring else { return }
+        guard report.findings.contains(where: { $0.id == "input-monitoring-missing" }) else { return }
+        didRequestInputMonitoring = true
+        _ = ListenEventAccess.request()
     }
 
     private func refreshNotificationAuthorization() async {

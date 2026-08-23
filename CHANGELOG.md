@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.2.5
+
+- Seizes the built-in MacBook trackpad during focused mode when the lid is open
+  and an external pointer is present, then restores it when Roblox quits.
+  Missing Input Monitoring is a warning, not an entry block; USBMouseStopsTrackpad
+  remains the no-permission fallback. Build 16 forces a helper replacement
+  after that change.
+
 ## 3.2.4
 
 - Advances the bundle build identity so Homebrew and Nix installs replace

@@ -98,6 +98,68 @@ struct RegistrationRepairPolicyTests {
         #expect(decision.message.contains("approval"))
     }
 
+    @Test("a successful register is not overwritten by a stale notRegistered snapshot")
+    func successfulRegisterSurvivesStaleSnapshot() {
+        #expect(
+            RegistrationRepairPolicy.coalesceLoginItemStatus(
+                observed: .notRegistered,
+                desired: true,
+                registeredThisSession: true
+            ) == .enabled
+        )
+        #expect(
+            RegistrationRepairPolicy.coalesceLoginItemStatus(
+                observed: .requiresApproval,
+                desired: true,
+                registeredThisSession: true
+            ) == .requiresApproval
+        )
+        #expect(
+            RegistrationRepairPolicy.coalesceLoginItemStatus(
+                observed: .enabled,
+                desired: true,
+                registeredThisSession: true
+            ) == .enabled
+        )
+        #expect(
+            RegistrationRepairPolicy.coalesceLoginItemStatus(
+                observed: .notRegistered,
+                desired: true,
+                registeredThisSession: false
+            ) == .notRegistered
+        )
+    }
+
+    @Test("after register, keep waiting only while Service Management still looks unbound")
+    func registerMutationWaitsForFreshStatus() {
+        let waiting = RegistrationRepairPolicy.resolvedStatusAfterMutation(
+            mutation: .register,
+            observed: .notRegistered,
+            elapsed: 0.2,
+            timeout: 6
+        )
+        #expect(waiting.keepWaiting)
+        #expect(waiting.status == .enabled)
+
+        let approved = RegistrationRepairPolicy.resolvedStatusAfterMutation(
+            mutation: .register,
+            observed: .requiresApproval,
+            elapsed: 0.2,
+            timeout: 6
+        )
+        #expect(!approved.keepWaiting)
+        #expect(approved.status == .requiresApproval)
+
+        let timedOut = RegistrationRepairPolicy.resolvedStatusAfterMutation(
+            mutation: .register,
+            observed: .notRegistered,
+            elapsed: 6,
+            timeout: 6
+        )
+        #expect(!timedOut.keepWaiting)
+        #expect(timedOut.status == .enabled)
+    }
+
     @Test("turning launch at login off unbinds a leftover enabled item")
     func undesiredEnabledItemUnbinds() {
         let decision = RegistrationRepairPolicy.loginItemDecision(

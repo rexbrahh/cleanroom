@@ -20,6 +20,16 @@ struct MenuLoginItemDecision: Equatable, Sendable {
     var message: String
 }
 
+enum LoginItemMutation: Equatable, Sendable {
+    case register
+    case unregister
+}
+
+struct LoginItemMutationResolution: Equatable, Sendable {
+    var status: MenuLoginItemStatus
+    var keepWaiting: Bool
+}
+
 enum RepairIssue: Equatable, Hashable, Sendable {
     case runningOutsideApplications
     case leftoverUserSpaceCopies(Int)
@@ -116,6 +126,44 @@ enum RegistrationRepairPolicy {
                 action: .none,
                 toggleOn: false,
                 message: "Menu-bar launch at login is off"
+            )
+        }
+    }
+
+    static func coalesceLoginItemStatus(
+        observed: MenuLoginItemStatus,
+        desired: Bool,
+        registeredThisSession: Bool
+    ) -> MenuLoginItemStatus {
+        if observed == .enabled || observed == .requiresApproval { return observed }
+        if desired && registeredThisSession && (observed == .notRegistered || observed == .unknown) {
+            return .enabled
+        }
+        return observed
+    }
+
+    static func resolvedStatusAfterMutation(
+        mutation: LoginItemMutation,
+        observed: MenuLoginItemStatus,
+        elapsed: TimeInterval,
+        timeout: TimeInterval = 6
+    ) -> LoginItemMutationResolution {
+        switch mutation {
+        case .register:
+            if observed == .enabled || observed == .requiresApproval {
+                return LoginItemMutationResolution(status: observed, keepWaiting: false)
+            }
+            return LoginItemMutationResolution(
+                status: .enabled,
+                keepWaiting: elapsed < timeout
+            )
+        case .unregister:
+            if observed == .notRegistered {
+                return LoginItemMutationResolution(status: observed, keepWaiting: false)
+            }
+            return LoginItemMutationResolution(
+                status: .notRegistered,
+                keepWaiting: elapsed < timeout
             )
         }
     }

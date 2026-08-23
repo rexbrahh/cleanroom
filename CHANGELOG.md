@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.2.6
+
+- Installs into `/Applications/Cleanroom.app` by default and fails instead of
+  falling back to `~/Applications`. Previous bundles are stored under
+  Application Support, not as sibling apps that steal login-item binding.
+- Persists launch-at-login intent and rebinds the running copy when System
+  Settings still shows Cleanroom but the in-app toggle is off.
+- Adds a Repair card for leftover user-space copies, Login Items approval,
+  and an agent that stays unreachable after automatic kickstart.
+- Adds an uninstall path that unregisters the helper and login item, then
+  removes system and leftover app copies. Local data stays unless
+  `--purge-data` or Settings asks to delete it. Build 17 forces a helper
+  replacement after those registration changes.
+
 ## 3.2.5
 
 - Seizes the built-in MacBook trackpad during focused mode when the lid is open

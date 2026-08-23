@@ -78,7 +78,9 @@ final class CleanroomViewModel: ObservableObject {
     private var didRequestInputMonitoring = false
     private var registrationInProgress = false
     private var lastRegistrationRepairAt = Date.distantPast
-    private var lastLoginItemStatus: MenuLoginItemStatus = .notRegistered
+    @Published private var lastLoginItemStatus: MenuLoginItemStatus = .notRegistered
+    private var loginItemRegisteredThisSession = false
+    private var becomeActiveObserver: NSObjectProtocol?
     private var statusPollCount = 0
     private var previousPhase: CleanroomPhase?
     private var pressureAlertGate = SystemPressureAlertGate()
@@ -362,6 +364,15 @@ final class CleanroomViewModel: ObservableObject {
             refreshInstallLocationHealth()
             await applyLoginItemRepairIfNeeded()
         }
+        becomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshRepairState()
+            }
+        }
         pollingTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
@@ -604,6 +615,7 @@ final class CleanroomViewModel: ObservableObject {
             handlePhaseTransition(to: status.phase)
             statusPollCount += 1
             if statusPollCount == 1 || statusPollCount.isMultiple(of: 5) {
+                refreshLaunchAtLoginStatus()
                 await refreshEvents()
                 await refreshRecoveryHistory()
                 await refreshPerformanceTimeline()
@@ -964,7 +976,12 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     func refreshLaunchAtLoginStatus() {
-        lastLoginItemStatus = Self.menuLoginItemStatus(from: SMAppService.mainApp.status)
+        let observed = Self.menuLoginItemStatus(from: SMAppService.mainApp.status)
+        lastLoginItemStatus = RegistrationRepairPolicy.coalesceLoginItemStatus(
+            observed: observed,
+            desired: launchAtLoginDesired,
+            registeredThisSession: loginItemRegisteredThisSession
+        )
         let decision = RegistrationRepairPolicy.loginItemDecision(
             desired: launchAtLoginDesired,
             status: lastLoginItemStatus,
@@ -987,7 +1004,8 @@ final class CleanroomViewModel: ObservableObject {
             } else {
                 do {
                     try await Self.unregisterMainApp()
-                    refreshLaunchAtLoginStatus()
+                    loginItemRegisteredThisSession = false
+                    await waitForLoginItemMutation(.unregister)
                 } catch {
                     refreshLaunchAtLoginStatus()
                     launchAtLoginMessage = "Login-item change failed: \(error.localizedDescription)"
@@ -1147,14 +1165,37 @@ final class CleanroomViewModel: ObservableObject {
             // Cleanroom while this copy reports the toggle as off.
             try? await Self.unregisterMainApp()
             try SMAppService.mainApp.register()
+            loginItemRegisteredThisSession = true
             logger.notice(
                 "Menu-app login item rebound (\(reason, privacy: .public)) from \(Bundle.main.bundleURL.path, privacy: .public)"
             )
-            refreshLaunchAtLoginStatus()
+            await waitForLoginItemMutation(.register)
         } catch {
             refreshLaunchAtLoginStatus()
             launchAtLoginMessage = "Login-item change failed: \(error.localizedDescription)"
             logger.error("Login-item change failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func waitForLoginItemMutation(_ mutation: LoginItemMutation) async {
+        let started = Date()
+        while !Task.isCancelled {
+            let observed = Self.menuLoginItemStatus(from: SMAppService.mainApp.status)
+            let resolution = RegistrationRepairPolicy.resolvedStatusAfterMutation(
+                mutation: mutation,
+                observed: observed,
+                elapsed: Date().timeIntervalSince(started)
+            )
+            lastLoginItemStatus = resolution.status
+            let decision = RegistrationRepairPolicy.loginItemDecision(
+                desired: launchAtLoginDesired,
+                status: lastLoginItemStatus,
+                preferredInstall: preferredInstall
+            )
+            launchAtLoginEnabled = decision.toggleOn
+            launchAtLoginMessage = decision.message
+            if !resolution.keepWaiting { return }
+            try? await Task.sleep(for: .milliseconds(250))
         }
     }
 

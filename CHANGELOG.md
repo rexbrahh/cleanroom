@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.2.7
+
+- Login-item status no longer stays on “will rebind” after a successful
+  register when Service Management still reports the copy as unbound.
+  Build 18 forces a helper replacement after that UI fix.
+
 ## 3.2.6
 
 - Installs into `/Applications/Cleanroom.app` by default and fails instead of

@@ -8,6 +8,7 @@ public actor MacSystemController: CleanroomSystemControlling {
     private let commands: any CommandRunning
     private let applications: any ApplicationManaging
     private let preferences: any PreferenceReading
+    private let trackpad: any BuiltInTrackpadControlling
     private let userIdentifier: uid_t
     private var preflightSuccesses: [String: Date] = [:]
 
@@ -15,19 +16,22 @@ public actor MacSystemController: CleanroomSystemControlling {
         commands: any CommandRunning,
         applications: any ApplicationManaging,
         preferences: any PreferenceReading = CFPreferenceReader(),
-        userIdentifier: uid_t = getuid()
+        userIdentifier: uid_t = getuid(),
+        trackpad: any BuiltInTrackpadControlling = NullBuiltInTrackpadController()
     ) {
         self.commands = commands
         self.applications = applications
         self.preferences = preferences
         self.userIdentifier = userIdentifier
+        self.trackpad = trackpad
     }
 
     @MainActor
     public static func live() -> MacSystemController {
         MacSystemController(
             commands: LocalCommandRunner(),
-            applications: WorkspaceApplicationManager()
+            applications: WorkspaceApplicationManager(),
+            trackpad: IOHIDBuiltInTrackpadController()
         )
     }
 
@@ -163,6 +167,7 @@ public actor MacSystemController: CleanroomSystemControlling {
             }
         }
         results.append(contentsOf: await synchronizeProcesses(Set(changedSyncProcesses)))
+        results.append(await applyBuiltInTrackpad(profile: profile))
 
         let policyResults =
             profile.services.compactMap { service in
@@ -263,6 +268,7 @@ public actor MacSystemController: CleanroomSystemControlling {
         for preference in profile.preferences {
             results.append(await verifyPreference(preference))
         }
+        results.append(await verifyBuiltInTrackpad(profile: profile))
         for service in profile.services {
             if profile.policy(for: service.label).disposition == .leaveRunning {
                 results.append(
@@ -343,6 +349,8 @@ public actor MacSystemController: CleanroomSystemControlling {
         if results.contains(where: { $0.outcome.blocksCompletion }) {
             return results
         }
+
+        results.append(await restoreBuiltInTrackpad())
 
         var changedSyncProcesses: [String] = []
         for stored in snapshot.preferences {
@@ -589,7 +597,7 @@ public actor MacSystemController: CleanroomSystemControlling {
             ("managed-applications", "Managed applications", managedApplications),
             ("process-load", "Process load", await processLoadFindings(profile: profile)),
             ("time-machine", "Time Machine", await timeMachineFindings()),
-            ("input", "Input devices and hooks", await inputFindings()),
+            ("input", "Input devices and hooks", await inputFindings(profile: profile)),
             ("network", "Network path", await networkFindings()),
             ("power-thermal", "Power and thermal state", await powerAndThermalFindings()),
         ]
@@ -856,6 +864,81 @@ public actor MacSystemController: CleanroomSystemControlling {
             remaining -= 1
         }
         return result
+    }
+
+    private func applyBuiltInTrackpad(profile: CleanroomProfile) async -> ActionResult {
+        let observation = await trackpad.observe()
+        let desired = BuiltInTrackpadPolicy.desiredSuppressed(
+            enabledInProfile: profile.suppressBuiltInTrackpadWhenLidOpen,
+            lid: observation.lid,
+            externalPointer: observation.externalPointer,
+            builtInTrackpadPresent: observation.builtInTrackpadPresent,
+            currentlySuppressed: observation.currentlySuppressed
+        )
+        if desired == observation.currentlySuppressed {
+            return ActionResult(
+                action: desired ? "suppress built-in trackpad" : "leave built-in trackpad",
+                target: "built-in-trackpad",
+                outcome: .skipped,
+                detail: desired
+                    ? "Already suppressed."
+                    : "Conditions do not require built-in trackpad suppression."
+            )
+        }
+        if desired {
+            if !observation.listenEventAccessGranted {
+                return ActionResult(
+                    action: "suppress built-in trackpad",
+                    target: "built-in-trackpad",
+                    outcome: .warning,
+                    detail: "Input Monitoring is not granted."
+                )
+            }
+            return await trackpad.suppress()
+        }
+        return await trackpad.restore()
+    }
+
+    private func verifyBuiltInTrackpad(profile: CleanroomProfile) async -> ActionResult {
+        let observation = await trackpad.observe()
+        let desired = BuiltInTrackpadPolicy.desiredSuppressed(
+            enabledInProfile: profile.suppressBuiltInTrackpadWhenLidOpen,
+            lid: observation.lid,
+            externalPointer: observation.externalPointer,
+            builtInTrackpadPresent: observation.builtInTrackpadPresent,
+            currentlySuppressed: observation.currentlySuppressed
+        )
+        let outcome = BuiltInTrackpadPolicy.verifyOutcome(
+            desired: desired,
+            currentlySuppressed: observation.currentlySuppressed,
+            listenEventAccessGranted: observation.listenEventAccessGranted
+        )
+        let detail: String
+        switch outcome {
+        case .succeeded:
+            detail = "Built-in trackpad remains suppressed."
+        case .skipped:
+            detail = "Built-in trackpad suppression is not required."
+        case .warning:
+            detail = "Input Monitoring is not granted; the built-in trackpad was not seized."
+        case .failed:
+            detail =
+                desired
+                ? "Built-in trackpad should be suppressed."
+                : "Built-in trackpad should be released."
+        case .unknown:
+            detail = "Built-in trackpad state could not be verified."
+        }
+        return ActionResult(
+            action: "verify built-in trackpad",
+            target: "built-in-trackpad",
+            outcome: outcome,
+            detail: detail
+        )
+    }
+
+    private func restoreBuiltInTrackpad() async -> ActionResult {
+        await trackpad.restore()
     }
 
     private func readPreference(_ preference: PreferenceAction) async throws -> StoredPreference {
@@ -1570,7 +1653,7 @@ public actor MacSystemController: CleanroomSystemControlling {
         ]
     }
 
-    private func inputFindings() async -> [PreflightFinding] {
+    private func inputFindings(profile: CleanroomProfile) async -> [PreflightFinding] {
         var findings: [PreflightFinding] = []
         let karabiner = await commands.run(
             "/usr/bin/pgrep",
@@ -1600,42 +1683,81 @@ public actor MacSystemController: CleanroomSystemControlling {
                 ))
         }
 
-        let devices = await commands.run(
-            "/usr/sbin/ioreg",
-            arguments: ["-r", "-c", "IOHIDDevice", "-k", "Transport", "-k", "Product", "-l"],
-            timeout: 5
-        )
-        if devices.succeeded {
-            let lower = devices.standardOutput.lowercased()
-            if !lower.contains("mouse") && !lower.contains("razer") {
-                findings.append(
-                    PreflightFinding(
-                        id: "external-mouse-missing",
-                        severity: .critical,
-                        category: "Input",
-                        summary: "External mouse was not detected",
-                        detail: "The built-in trackpad will be disabled while an external pointing device is present.",
-                        remediation: "Connect the gameplay mouse before launching Roblox."
-                    ))
-            } else {
-                findings.append(
-                    PreflightFinding(
-                        id: "external-pointer-ready",
-                        severity: .information,
-                        category: "Input",
-                        summary: "External gameplay pointer detected",
-                        detail: "Cleanroom can gate the built-in trackpad while the external pointer is present."
-                    ))
-            }
-        } else {
+        let observation = await trackpad.observe()
+        switch observation.externalPointer {
+        case .present:
+            findings.append(
+                PreflightFinding(
+                    id: "external-pointer-ready",
+                    severity: .information,
+                    category: "Input",
+                    summary: "External gameplay pointer detected",
+                    detail: "The built-in trackpad can be seized while the lid is open and this pointer is present."
+                ))
+        case .absent:
+            findings.append(
+                PreflightFinding(
+                    id: "external-mouse-missing",
+                    severity: .critical,
+                    category: "Input",
+                    summary: "External mouse was not detected",
+                    detail: "The built-in trackpad stays on unless an external pointing device is present.",
+                    remediation: "Connect the gameplay mouse before launching Roblox."
+                ))
+        case .unknown:
             findings.append(
                 PreflightFinding(
                     id: "pointer-scan-unknown",
                     severity: .warning,
                     category: "Input",
                     summary: "External pointer state is unknown",
-                    detail: commandFailure(devices),
+                    detail: "Cleanroom could not inspect HID pointing devices.",
                     remediation: "Confirm the gameplay mouse is connected."
+                ))
+        }
+
+        switch observation.lid {
+        case .open:
+            findings.append(
+                PreflightFinding(
+                    id: "lid-open",
+                    severity: .information,
+                    category: "Input",
+                    summary: "Laptop lid is open",
+                    detail: "The built-in trackpad will be disabled when an external pointer is present."
+                ))
+        case .closed:
+            findings.append(
+                PreflightFinding(
+                    id: "lid-closed",
+                    severity: .information,
+                    category: "Input",
+                    summary: "Laptop lid is closed",
+                    detail: "The built-in trackpad is already unused in clamshell mode."
+                ))
+        case .unknown:
+            findings.append(
+                PreflightFinding(
+                    id: "lid-state-unknown",
+                    severity: .warning,
+                    category: "Input",
+                    summary: "Laptop lid state is unknown",
+                    detail: "Cleanroom will not change built-in trackpad suppression based on lid state.",
+                    remediation: "Re-run preflight if accidental trackpad input is a concern."
+                ))
+        }
+
+        if profile.suppressBuiltInTrackpadWhenLidOpen, !observation.listenEventAccessGranted {
+            findings.append(
+                PreflightFinding(
+                    id: "input-monitoring-missing",
+                    severity: .warning,
+                    category: "Input",
+                    summary: "Input Monitoring is not granted",
+                    detail:
+                        "Hard-disabling the built-in trackpad needs Input Monitoring. USBMouseStopsTrackpad still applies.",
+                    remediation:
+                        "System Settings → Privacy & Security → Input Monitoring → enable Cleanroom (and cleanroom-agent if listed)."
                 ))
         }
         return findings

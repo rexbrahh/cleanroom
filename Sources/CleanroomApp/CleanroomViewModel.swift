@@ -67,6 +67,7 @@ final class CleanroomViewModel: ObservableObject {
     private let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
     private var pollingTask: Task<Void, Never>?
     private var started = false
+    private var didRequestInputMonitoring = false
     private var registrationInProgress = false
     private var lastRegistrationRepairAt = Date.distantPast
     private var statusPollCount = 0
@@ -196,7 +197,8 @@ final class CleanroomViewModel: ObservableObject {
             preferences: template.preferences,
             processCPUWarningPercent: template.processCPUWarningPercent,
             processCPUCriticalPercent: template.processCPUCriticalPercent,
-            blockAutomaticEntryOnCriticalPreflight: template.blockAutomaticEntryOnCriticalPreflight
+            blockAutomaticEntryOnCriticalPreflight: template.blockAutomaticEntryOnCriticalPreflight,
+            suppressBuiltInTrackpadWhenLidOpen: template.suppressBuiltInTrackpadWhenLidOpen
         )
     }
 
@@ -480,6 +482,7 @@ final class CleanroomViewModel: ObservableObject {
             if self.preflight != resolvedPreflight {
                 self.preflight = resolvedPreflight
             }
+            requestInputMonitoringIfNeeded(from: resolvedPreflight)
             if connectionMessage != status.lastMessage {
                 connectionMessage = status.lastMessage
             }
@@ -944,6 +947,7 @@ final class CleanroomViewModel: ObservableObject {
                 case .preflight(let report):
                     preflight = report
                     connectionMessage = "Competitive preflight completed."
+                    requestInputMonitoringIfNeeded(from: report)
                 case .events(let events):
                     recentEvents = events.reversed()
                 case .performanceTimeline(let records):
@@ -986,6 +990,13 @@ final class CleanroomViewModel: ObservableObject {
                 await client.invalidate()
             }
         }
+    }
+
+    private func requestInputMonitoringIfNeeded(from report: PreflightReport?) {
+        guard let report, !didRequestInputMonitoring else { return }
+        guard report.findings.contains(where: { $0.id == "input-monitoring-missing" }) else { return }
+        didRequestInputMonitoring = true
+        _ = ListenEventAccess.request()
     }
 
     private func refreshNotificationAuthorization() async {

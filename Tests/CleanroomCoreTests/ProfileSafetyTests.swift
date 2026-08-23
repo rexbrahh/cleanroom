@@ -49,8 +49,9 @@ struct ProfileSafetyTests {
         #expect(
             safeReport.mutations.count
                 == safe.applications.count + safe.services.count + safe.processes.count
-                + safe.preferences.count
+                + safe.preferences.count + 1
         )
+        #expect(safeReport.mutations.contains { $0.target == "built-in-trackpad" })
 
         let unsafe = CleanroomProfile(
             identifier: "unsafe",

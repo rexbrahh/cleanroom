@@ -331,9 +331,9 @@ final class CleanroomViewModel: ObservableObject {
     private func replaceEnabledAgent(service: SMAppService, digest: String?) async {
         agentRegistrationReady = false
         registrationMessage = "Refreshing background-agent registration…"
-        for attempt in 1...2 {
+        for _ in 1...2 {
             do {
-                try await service.unregister()
+                try await Self.unregisterLaunchAgent()
             } catch {
                 logger.error(
                     "Agent unregister before recycle failed: \(error.localizedDescription, privacy: .public)"
@@ -358,6 +358,14 @@ final class CleanroomViewModel: ObservableObject {
         registrationMessage =
             "Background agent is registered but not answering; use Replace Agent Registration"
         agentRegistrationReady = false
+    }
+
+    nonisolated private static func unregisterLaunchAgent() async throws {
+        try await SMAppService.agent(plistName: "com.rex.cleanroom.agent.plist").unregister()
+    }
+
+    nonisolated private static func unregisterMainApp() async throws {
+        try await SMAppService.mainApp.unregister()
     }
 
     private func waitUntilAgentAnswers(timeout: TimeInterval) async -> Bool {
@@ -851,11 +859,11 @@ final class CleanroomViewModel: ObservableObject {
                     // Unregister first: a stale login-item registration can be
                     // bound to an old app location (e.g. a dist/ build), which
                     // silently keeps launch-at-login pointed at the wrong copy.
-                    try? await SMAppService.mainApp.unregister()
+                    try? await Self.unregisterMainApp()
                     try SMAppService.mainApp.register()
                     logger.notice("Menu-app login item registered from \(Bundle.main.bundleURL.path, privacy: .public)")
                 } else {
-                    try await SMAppService.mainApp.unregister()
+                    try await Self.unregisterMainApp()
                 }
                 refreshLaunchAtLoginStatus()
             } catch {

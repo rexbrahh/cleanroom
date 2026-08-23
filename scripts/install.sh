@@ -3,12 +3,13 @@ set -euo pipefail
 
 ROOT="${0:A:h:h}"
 SOURCE_APP="$ROOT/dist/Cleanroom.app"
-DESTINATION_DIR="${CLEANROOM_DESTINATION_DIR:-$HOME/Applications}"
+DESTINATION_DIR="${CLEANROOM_DESTINATION_DIR:-/Applications}"
 DESTINATION_APP="$DESTINATION_DIR/Cleanroom.app"
 CLI_LINK_DIR="${CLEANROOM_CLI_LINK_DIR:-$HOME/bin}"
 SUPPORT_DIR="${CLEANROOM_HOME:-$HOME/Library/Application Support/Cleanroom}"
 RECOVERY_JOURNAL="$SUPPORT_DIR/recovery.json"
 REPLACEMENT_AUTHORIZATION="$SUPPORT_DIR/replace-agent-registration"
+USER_SPACE_APP="$HOME/Applications/Cleanroom.app"
 
 AGENT_REL="Contents/Library/LaunchServices/cleanroom-agent"
 OLD_HASH=""
@@ -19,7 +20,23 @@ fi
 
 "$ROOT/scripts/build-app.sh"
 BIN_PATH="$(swift build -c "${CONFIGURATION:-release}" --show-bin-path)"
-mkdir -p "$DESTINATION_DIR" "$CLI_LINK_DIR"
+if [[ ! -d "$DESTINATION_DIR" ]]; then
+  if [[ -n "${CLEANROOM_DESTINATION_DIR:-}" ]]; then
+    mkdir -p "$DESTINATION_DIR"
+  else
+    print -u2 -r -- "Missing $DESTINATION_DIR."
+    exit 66
+  fi
+fi
+if [[ ! -w "$DESTINATION_DIR" ]]; then
+  print -u2 -r -- "Cannot write $DESTINATION_APP. Copy Cleanroom.app into /Applications, or set CLEANROOM_DESTINATION_DIR to a writable path. ~/Applications is not a supported default."
+  exit 77
+fi
+if [[ -n "${CLEANROOM_DESTINATION_DIR:-}" && "$DESTINATION_DIR" == "$HOME/Applications" ]]; then
+  print -u2 -r -- "Installing into ~/Applications binds login items unreliably. Prefer /Applications."
+fi
+mkdir -p "$CLI_LINK_DIR" "$SUPPORT_DIR/previous"
+chmod 700 "$SUPPORT_DIR"
 NEW_HASH="$(/usr/bin/codesign -dv --verbose=4 "$SOURCE_APP/$AGENT_REL" 2>&1 \
   | /usr/bin/awk -F= '/^CDHash=/{print $2}')"
 
@@ -48,7 +65,7 @@ trap cleanup EXIT
 "$BIN_PATH/cleanroom-install-helper" "$STAGED_APP" "$DESTINATION_APP"
 SWAPPED=1
 if [[ -d "$STAGED_APP" ]]; then
-  BACKUP_APP="$DESTINATION_DIR/Cleanroom.previous.$(/bin/date +%Y%m%d%H%M%S).$$.app"
+  BACKUP_APP="$SUPPORT_DIR/previous/Cleanroom.previous.$(/bin/date +%Y%m%d%H%M%S).$$.app"
   /bin/mv "$STAGED_APP" "$BACKUP_APP"
   print -r -- "Previous app preserved at $BACKUP_APP"
 fi
@@ -82,5 +99,8 @@ else
   print -r -- "Agent binary changed, but active recovery state blocks automatic replacement."
 fi
 
+if [[ -d "$USER_SPACE_APP" && "$DESTINATION_APP" != "$USER_SPACE_APP" ]]; then
+  print -u2 -r -- "Leftover copy remains at $USER_SPACE_APP. Remove it from the Repair card so login items bind only to $DESTINATION_APP."
+fi
 print -r -- "Installed $DESTINATION_APP"
-print -r -- "Open Cleanroom.app once to register its background agent."
+print -r -- "Open /Applications/Cleanroom.app once to register its background agent."

@@ -59,9 +59,17 @@ final class CleanroomViewModel: ObservableObject {
     @Published var batteryAlertThreshold: Int
     @Published var notificationMessage = "Gameplay notifications are off"
     @Published var launchAtLoginEnabled = false
+    @Published var launchAtLoginDesired = true
     @Published var launchAtLoginMessage = "Checking menu-app launch at login…"
     @Published var setupDoctorVisible: Bool
     @Published var menuItemConfirmed: Bool
+    @Published var preferredInstall = false
+    @Published var leftoverCopyURLs: [URL] = []
+    @Published var agentRequiresApproval = false
+    @Published var agentUnreachableAfterRepair = false
+    @Published var presentingLeftoverRemovalConfirmation = false
+    @Published var presentingUninstallConfirmation = false
+    @Published var uninstallPurgeData = false
 
     private let client = CleanroomAgentClient()
     private let logger = Logger(subsystem: "com.rex.cleanroom", category: "app")
@@ -70,6 +78,7 @@ final class CleanroomViewModel: ObservableObject {
     private var didRequestInputMonitoring = false
     private var registrationInProgress = false
     private var lastRegistrationRepairAt = Date.distantPast
+    private var lastLoginItemStatus: MenuLoginItemStatus = .notRegistered
     private var statusPollCount = 0
     private var previousPhase: CleanroomPhase?
     private var pressureAlertGate = SystemPressureAlertGate()
@@ -81,6 +90,7 @@ final class CleanroomViewModel: ObservableObject {
     private static let batteryThresholdPreferenceKey = "batteryAlertThreshold"
     private static let setupCompletedPreferenceKey = "setupDoctorCompleted"
     private static let menuItemConfirmedPreferenceKey = "setupDoctorMenuItemConfirmed"
+    private static let launchAtLoginDesiredPreferenceKey = "launchAtLoginDesired"
     private static let installerReplacementAuthorizationURL =
         CleanroomPaths.applicationSupportDirectory.appendingPathComponent(
             "replace-agent-registration"
@@ -105,6 +115,21 @@ final class CleanroomViewModel: ObservableObject {
         batteryAlertThreshold = savedBatteryThreshold == 0 ? 20 : savedBatteryThreshold
         setupDoctorVisible = !UserDefaults.standard.bool(forKey: Self.setupCompletedPreferenceKey)
         menuItemConfirmed = UserDefaults.standard.bool(forKey: Self.menuItemConfirmedPreferenceKey)
+        let storedLaunchAtLogin: Bool? =
+            UserDefaults.standard.object(forKey: Self.launchAtLoginDesiredPreferenceKey) == nil
+            ? nil
+            : UserDefaults.standard.bool(forKey: Self.launchAtLoginDesiredPreferenceKey)
+        launchAtLoginDesired = RegistrationRepairPolicy.resolvedLaunchAtLoginDesired(
+            stored: storedLaunchAtLogin
+        )
+        launchAtLoginEnabled = launchAtLoginDesired
+        if storedLaunchAtLogin == nil {
+            UserDefaults.standard.set(
+                launchAtLoginDesired,
+                forKey: Self.launchAtLoginDesiredPreferenceKey
+            )
+        }
+        refreshInstallLocationHealth()
     }
 
     enum AgentHealth {
@@ -185,6 +210,71 @@ final class CleanroomViewModel: ObservableObject {
         )
     }
 
+    var launchAtLoginBound: Bool {
+        lastLoginItemStatus == .enabled
+    }
+
+    var loginItemDecision: MenuLoginItemDecision {
+        RegistrationRepairPolicy.loginItemDecision(
+            desired: launchAtLoginDesired,
+            status: lastLoginItemStatus,
+            preferredInstall: preferredInstall
+        )
+    }
+
+    var repairIssues: [RepairIssue] {
+        RegistrationRepairPolicy.issues(
+            preferredInstall: preferredInstall,
+            leftoverCount: leftoverCopyURLs.count,
+            loginItem: loginItemDecision,
+            agentRequiresApproval: agentRequiresApproval,
+            agentUnreachableAfterRepair: agentUnreachableAfterRepair
+        )
+    }
+
+    var repairCardVisible: Bool {
+        RegistrationRepairPolicy.shouldPresentRepairCard(
+            setupDoctorVisible: setupDoctorVisible,
+            issues: repairIssues
+        )
+    }
+
+    func title(for issue: RepairIssue) -> String {
+        switch issue {
+        case .runningOutsideApplications:
+            return "Install location"
+        case .leftoverUserSpaceCopies:
+            return "Leftover user-space copies"
+        case .loginItemNeedsApproval:
+            return "Login-item approval"
+        case .loginItemNeedsRebind:
+            return "Login-item binding"
+        case .agentNeedsApproval:
+            return "Background-agent approval"
+        case .agentUnreachable:
+            return "Background agent"
+        }
+    }
+
+    func detail(for issue: RepairIssue) -> String {
+        switch issue {
+        case .runningOutsideApplications:
+            return "Keep only \(RegistrationRepairPolicy.preferredBundlePath) and reopen that copy."
+        case .leftoverUserSpaceCopies(let count):
+            let names = leftoverCopyURLs.map(\.lastPathComponent).joined(separator: ", ")
+            return
+                "\(count) leftover \(count == 1 ? "copy" : "copies") in ~/Applications (\(names)) can steal login-item binding."
+        case .loginItemNeedsApproval:
+            return launchAtLoginMessage
+        case .loginItemNeedsRebind:
+            return launchAtLoginMessage
+        case .agentNeedsApproval:
+            return registrationMessage
+        case .agentUnreachable:
+            return connectionMessage
+        }
+    }
+
     var profileDraft: CleanroomProfile {
         let template = CleanroomProfile.phantomForces()
         return CleanroomProfile(
@@ -240,6 +330,15 @@ final class CleanroomViewModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        if CommandLine.arguments.contains("--uninstall") {
+            logger.notice("View model started in uninstall mode")
+            Task { [weak self] in
+                await self?.performUninstall(
+                    purgeData: CommandLine.arguments.contains("--purge-data")
+                )
+            }
+            return
+        }
         logger.notice("View model started; refreshing registration state")
         Task { [weak self] in
             guard let self else { return }
@@ -260,7 +359,8 @@ final class CleanroomViewModel: ObservableObject {
             await refreshProfiles()
             await refreshCalibration()
             await refreshNotificationAuthorization()
-            refreshLaunchAtLoginStatus()
+            refreshInstallLocationHealth()
+            await applyLoginItemRepairIfNeeded()
         }
         pollingTask = Task { [weak self] in
             guard let self else { return }
@@ -297,6 +397,7 @@ final class CleanroomViewModel: ObservableObject {
         )
         switch service.status {
         case .enabled:
+            agentRequiresApproval = false
             if Self.shouldReplaceEnabledAgent(
                 triggerPermitsDestructiveReplacement: trigger.permitsDestructiveReplacement,
                 digestChanged: digestChanged,
@@ -315,11 +416,14 @@ final class CleanroomViewModel: ObservableObject {
                 agentRegistrationReady = true
             }
         case .requiresApproval:
+            agentRequiresApproval = true
             registrationMessage = "Background agent requires approval in Login Items"
             agentRegistrationReady = false
         case .notRegistered, .notFound:
+            agentRequiresApproval = false
             await replaceEnabledAgent(service: service, digest: digest)
         @unknown default:
+            agentRequiresApproval = false
             registrationMessage = "Background-agent status is unknown"
             agentRegistrationReady = false
         }
@@ -476,6 +580,9 @@ final class CleanroomViewModel: ObservableObject {
             if self.status != status {
                 self.status = status
             }
+            if agentUnreachableAfterRepair {
+                agentUnreachableAfterRepair = false
+            }
             if Self.shouldClearInstallerReplacementAuthorization(
                 agentBuild: response.agentBuild,
                 currentBuild: CleanroomBuildIdentity.current,
@@ -533,6 +640,7 @@ final class CleanroomViewModel: ObservableObject {
             timeout: 5
         )
         if await probeAgent() {
+            agentUnreachableAfterRepair = false
             logger.notice("Agent answered after kickstart; no re-registration needed")
             return
         }
@@ -540,6 +648,7 @@ final class CleanroomViewModel: ObservableObject {
             atPath: FileRecoveryJournalStore().journalURL.path
         )
         if journalExists {
+            agentUnreachableAfterRepair = true
             registrationMessage =
                 "Agent unreachable after non-destructive repair; replace its registration only when no transition is running"
             logger.error("Agent still unreachable after non-destructive kickstart")
@@ -549,6 +658,7 @@ final class CleanroomViewModel: ObservableObject {
             force: true,
             trigger: .installerAuthorizedReplacement
         )
+        agentUnreachableAfterRepair = !(await probeAgent())
     }
 
     private func probeAgent() async -> Bool {
@@ -564,9 +674,26 @@ final class CleanroomViewModel: ObservableObject {
     /// The polling cadence means the menu can show slightly stale state when
     /// it opens; refresh immediately so what the user sees is never behind.
     func menuOpened() {
+        refreshRepairState()
         Task { [weak self] in
             await self?.refreshStatus()
         }
+    }
+
+    func refreshRepairState() {
+        refreshInstallLocationHealth()
+        refreshLaunchAtLoginStatus()
+        refreshAgentApprovalStatus()
+    }
+
+    func refreshInstallLocationHealth() {
+        preferredInstall = RegistrationRepairPolicy.isPreferredInstall(
+            bundleURL: Bundle.main.bundleURL
+        )
+        leftoverCopyURLs = RegistrationRepairPolicy.leftoverUserSpaceCopies(
+            in: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications"),
+            runningBundleURL: Bundle.main.bundleURL
+        )
     }
 
     func refreshEvents() async {
@@ -837,40 +964,219 @@ final class CleanroomViewModel: ObservableObject {
     }
 
     func refreshLaunchAtLoginStatus() {
-        let status = SMAppService.mainApp.status
-        launchAtLoginEnabled = status == .enabled
-        switch status {
-        case .enabled:
-            launchAtLoginMessage = "Menu-bar app launches at login"
-        case .requiresApproval:
-            launchAtLoginMessage = "Launch at login requires approval in Login Items"
-        case .notRegistered, .notFound:
-            launchAtLoginMessage = "Menu-bar launch at login is off"
-        @unknown default:
-            launchAtLoginMessage = "Menu-bar launch-at-login state is unknown"
-        }
+        lastLoginItemStatus = Self.menuLoginItemStatus(from: SMAppService.mainApp.status)
+        let decision = RegistrationRepairPolicy.loginItemDecision(
+            desired: launchAtLoginDesired,
+            status: lastLoginItemStatus,
+            preferredInstall: preferredInstall
+        )
+        launchAtLoginEnabled = decision.toggleOn
+        launchAtLoginMessage = decision.message
     }
 
     func setLaunchAtLoginEnabled(_ enabled: Bool) {
+        persistLaunchAtLoginDesired(enabled)
         Task { [weak self] in
             guard let self else { return }
-            do {
-                if enabled {
-                    // Unregister first: a stale login-item registration can be
-                    // bound to an old app location (e.g. a dist/ build), which
-                    // silently keeps launch-at-login pointed at the wrong copy.
-                    try? await Self.unregisterMainApp()
-                    try SMAppService.mainApp.register()
-                    logger.notice("Menu-app login item registered from \(Bundle.main.bundleURL.path, privacy: .public)")
-                } else {
-                    try await Self.unregisterMainApp()
+            if enabled {
+                if !preferredInstall {
+                    refreshLaunchAtLoginStatus()
+                    return
                 }
-                refreshLaunchAtLoginStatus()
-            } catch {
-                refreshLaunchAtLoginStatus()
-                launchAtLoginMessage = "Login-item change failed: \(error.localizedDescription)"
-                logger.error("Login-item change failed: \(error.localizedDescription, privacy: .public)")
+                await rebindLoginItem(reason: "user")
+            } else {
+                do {
+                    try await Self.unregisterMainApp()
+                    refreshLaunchAtLoginStatus()
+                } catch {
+                    refreshLaunchAtLoginStatus()
+                    launchAtLoginMessage = "Login-item change failed: \(error.localizedDescription)"
+                    logger.error("Login-item change failed: \(error.localizedDescription, privacy: .public)")
+                }
             }
+        }
+    }
+
+    func uninstallCleanroom() {
+        let purge = uninstallPurgeData
+        Task { [weak self] in
+            await self?.performUninstall(purgeData: purge)
+        }
+    }
+
+    func removeLeftoverCopies() {
+        let running = RegistrationRepairPolicy.standardized(Bundle.main.bundleURL)
+        let urls = leftoverCopyURLs.filter {
+            RegistrationRepairPolicy.standardized($0) != running
+        }
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.recycle(urls) { [weak self] _, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    self.connectionMessage =
+                        "Leftover copies could not be moved to Trash: \(error.localizedDescription)"
+                } else {
+                    self.relinkCLIIfNeeded()
+                    self.connectionMessage = "Moved leftover Cleanroom copies to Trash."
+                }
+                self.refreshInstallLocationHealth()
+            }
+        }
+    }
+
+    private func relinkCLIIfNeeded() {
+        let fileManager = FileManager.default
+        let preferred = URL(fileURLWithPath: RegistrationRepairPolicy.preferredBundlePath)
+            .appendingPathComponent("Contents/Resources/cleanroomctl")
+        guard fileManager.isExecutableFile(atPath: preferred.path) else { return }
+        let link = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("bin/cleanroomctl")
+        let hasLink =
+            fileManager.fileExists(atPath: link.path)
+            || ((try? fileManager.destinationOfSymbolicLink(atPath: link.path)) != nil)
+        guard hasLink else { return }
+        do {
+            try fileManager.removeItem(at: link)
+            try fileManager.createSymbolicLink(at: link, withDestinationURL: preferred)
+        } catch {
+            logger.error(
+                "cleanroomctl retarget failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func performUninstall(purgeData: Bool) async {
+        refreshInstallLocationHealth()
+        let plan = currentUninstallPlan(purgeData: purgeData)
+        logger.notice("Uninstall started; purge=\(purgeData, privacy: .public)")
+        for step in plan.steps {
+            switch step {
+            case .unregisterAgent:
+                try? await Self.unregisterLaunchAgent()
+            case .unregisterLoginItem:
+                try? await Self.unregisterMainApp()
+            case .bootoutAgent:
+                _ = await LocalCommandRunner().run(
+                    "/bin/launchctl",
+                    arguments: ["bootout", "gui/\(getuid())/com.rex.cleanroom.agent"],
+                    timeout: 5
+                )
+            case .trashBundles:
+                await trashUninstallBundles(plan.bundlesToTrash)
+            case .removeExtraFiles:
+                removeUninstallFiles(plan.extraRemovals, purgeDefaults: purgeData)
+            case .quitApp:
+                NSApplication.shared.terminate(nil)
+            }
+        }
+    }
+
+    private func currentUninstallPlan(purgeData: Bool) -> UninstallPlan {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        let cli = home.appendingPathComponent("bin/cleanroomctl")
+        let destination = try? fileManager.destinationOfSymbolicLink(atPath: cli.path)
+        let hasCLI = destination != nil || fileManager.fileExists(atPath: cli.path)
+        let legacy = home.appendingPathComponent(
+            "Library/LaunchAgents/com.rex.cleanroom.agent.plist"
+        )
+        let previousDir = CleanroomPaths.applicationSupportDirectory.appendingPathComponent(
+            "previous"
+        )
+        return UninstallPolicy.plan(
+            runningBundleURL: Bundle.main.bundleURL,
+            preferredBundleURL: URL(fileURLWithPath: RegistrationRepairPolicy.preferredBundlePath),
+            leftoverCopies: leftoverCopyURLs,
+            previousBackups: UninstallPolicy.previousInstallBackups(in: previousDir),
+            cliLink: hasCLI ? cli : nil,
+            cliLinkPointsAtCleanroom: UninstallPolicy.shouldRemoveCLILink(destination: destination),
+            legacyLaunchAgentPlist: fileManager.fileExists(atPath: legacy.path) ? legacy : nil,
+            supportDirectory: CleanroomPaths.applicationSupportDirectory,
+            purgeData: purgeData
+        )
+    }
+
+    private func trashUninstallBundles(_ urls: [URL]) async {
+        let existing = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !existing.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            NSWorkspace.shared.recycle(existing) { _, _ in
+                continuation.resume()
+            }
+        }
+    }
+
+    private func removeUninstallFiles(_ urls: [URL], purgeDefaults: Bool) {
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if purgeDefaults {
+            UserDefaults.standard.removePersistentDomain(forName: "com.rex.cleanroom")
+        }
+    }
+
+    private func persistLaunchAtLoginDesired(_ enabled: Bool) {
+        launchAtLoginDesired = enabled
+        launchAtLoginEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.launchAtLoginDesiredPreferenceKey)
+    }
+
+    private func applyLoginItemRepairIfNeeded() async {
+        refreshLaunchAtLoginStatus()
+        switch loginItemDecision.action {
+        case .rebindCurrentBundle:
+            await rebindLoginItem(reason: "automatic")
+        case .unbindCurrentBundle:
+            do {
+                try await Self.unregisterMainApp()
+            } catch {
+                logger.error(
+                    "Automatic login-item unbind failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            refreshLaunchAtLoginStatus()
+        case .requestApproval, .none:
+            break
+        }
+    }
+
+    private func rebindLoginItem(reason: String) async {
+        do {
+            // Unregister first: a stale login-item registration can be bound
+            // to an old app location, which keeps System Settings showing
+            // Cleanroom while this copy reports the toggle as off.
+            try? await Self.unregisterMainApp()
+            try SMAppService.mainApp.register()
+            logger.notice(
+                "Menu-app login item rebound (\(reason, privacy: .public)) from \(Bundle.main.bundleURL.path, privacy: .public)"
+            )
+            refreshLaunchAtLoginStatus()
+        } catch {
+            refreshLaunchAtLoginStatus()
+            launchAtLoginMessage = "Login-item change failed: \(error.localizedDescription)"
+            logger.error("Login-item change failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func refreshAgentApprovalStatus() {
+        let status = SMAppService.agent(plistName: "com.rex.cleanroom.agent.plist").status
+        agentRequiresApproval = status == .requiresApproval
+        if status == .requiresApproval {
+            registrationMessage = "Background agent requires approval in Login Items"
+            agentRegistrationReady = false
+        }
+    }
+
+    private static func menuLoginItemStatus(from status: SMAppService.Status) -> MenuLoginItemStatus {
+        switch status {
+        case .enabled:
+            return .enabled
+        case .requiresApproval:
+            return .requiresApproval
+        case .notRegistered, .notFound:
+            return .notRegistered
+        @unknown default:
+            return .unknown
         }
     }
 

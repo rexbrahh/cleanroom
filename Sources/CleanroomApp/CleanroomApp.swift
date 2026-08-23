@@ -33,13 +33,17 @@ struct CleanroomApp: App {
         Window("Cleanroom", id: "dashboard") {
             DashboardView(model: model)
                 .frame(minWidth: 760, minHeight: 580)
-                .task { model.start() }
+                .task {
+                    model.start()
+                    model.refreshRepairState()
+                }
         }
         .defaultSize(width: 900, height: 700)
 
         Settings {
             CleanroomSettingsView(model: model)
                 .frame(width: 520)
+                .onAppear { model.refreshRepairState() }
         }
     }
 
@@ -155,6 +159,23 @@ private struct DashboardView: View {
                 "Only discard after manually confirming that pointer, trackpad, hot-corner, app, and window-management state has already been restored."
             )
         }
+        .alert(
+            "Move leftover copies to Trash?",
+            isPresented: $model.presentingLeftoverRemovalConfirmation
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Move to Trash", role: .destructive) { model.removeLeftoverCopies() }
+        } message: {
+            Text(
+                "This removes extra Cleanroom copies under ~/Applications. The copy in /Applications is kept."
+            )
+        }
+        .alert("Uninstall Cleanroom?", isPresented: $model.presentingUninstallConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Uninstall", role: .destructive) { model.uninstallCleanroom() }
+        } message: {
+            Text(uninstallConfirmationMessage(purgeData: model.uninstallPurgeData))
+        }
     }
 
     @ViewBuilder
@@ -163,6 +184,9 @@ private struct DashboardView: View {
         case .overview:
             if model.setupDoctorVisible {
                 setupDoctorCard
+            }
+            if model.repairCardVisible {
+                repairCard
             }
             healthCard
             agentCard
@@ -252,7 +276,7 @@ private struct DashboardView: View {
                 setupRow(
                     title: "Login-item approval",
                     detail: model.launchAtLoginMessage,
-                    complete: model.launchAtLoginEnabled
+                    complete: model.launchAtLoginBound
                 )
                 setupRow(
                     title: "Menu-item checkpoint",
@@ -269,7 +293,7 @@ private struct DashboardView: View {
                     if !model.notificationsEnabled {
                         Button("Enable Notifications") { model.setNotificationsEnabled(true) }
                     }
-                    if !model.launchAtLoginEnabled {
+                    if !model.launchAtLoginBound {
                         Button("Enable Launch at Login") { model.setLaunchAtLoginEnabled(true) }
                     }
                     if !model.menuItemConfirmed {
@@ -279,6 +303,48 @@ private struct DashboardView: View {
                     Button("Finish Setup") { model.completeSetupDoctor() }
                         .buttonStyle(.borderedProminent)
                         .disabled(!model.setupDoctorState.canComplete)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private var repairCard: some View {
+        GroupBox("Repair") {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(model.repairIssues, id: \.self) { issue in
+                    setupRow(
+                        title: model.title(for: issue),
+                        detail: model.detail(for: issue),
+                        complete: false
+                    )
+                }
+                HStack {
+                    if model.repairIssues.contains(where: {
+                        if case .leftoverUserSpaceCopies = $0 { return true }
+                        return false
+                    }) {
+                        Button("Move Leftover Copies to Trash…") {
+                            model.presentingLeftoverRemovalConfirmation = true
+                        }
+                    }
+                    if model.repairIssues.contains(.loginItemNeedsApproval)
+                        || model.repairIssues.contains(.agentNeedsApproval)
+                    {
+                        Button("Open Login Items") { model.openLoginItemsSettings() }
+                    }
+                    if model.repairIssues.contains(.loginItemNeedsRebind) {
+                        Button("Repair Login Item") { model.setLaunchAtLoginEnabled(true) }
+                    }
+                    if model.repairIssues.contains(.agentNeedsApproval)
+                        || model.repairIssues.contains(.agentUnreachable)
+                    {
+                        Button("Replace Agent Registration") { model.registerAgent() }
+                    }
+                    Button("Uninstall Cleanroom…", role: .destructive) {
+                        model.presentingUninstallConfirmation = true
+                    }
+                    Spacer()
                 }
             }
             .padding(.vertical, 4)
@@ -852,13 +918,30 @@ private struct CleanroomSettingsView: View {
                 Toggle(
                     "Launch the Cleanroom menu app at login",
                     isOn: Binding(
-                        get: { model.launchAtLoginEnabled },
+                        get: { model.launchAtLoginDesired },
                         set: { model.setLaunchAtLoginEnabled($0) }
                     )
                 )
                 Text(model.launchAtLoginMessage)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if !model.preferredInstall {
+                    Text(
+                        "This copy is not \(RegistrationRepairPolicy.preferredBundlePath). Login items should bind to that path only."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                if !model.leftoverCopyURLs.isEmpty {
+                    Text(
+                        "Leftover copies in ~/Applications can keep this toggle off while System Settings still shows Cleanroom."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Button("Move Leftover Copies to Trash…") {
+                        model.presentingLeftoverRemovalConfirmation = true
+                    }
+                }
                 Text("The recovery agent remains registered independently of this menu-bar preference.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -928,6 +1011,18 @@ private struct CleanroomSettingsView: View {
                     .disabled(model.calibrationHardwareIdentifier == "unknown")
             }
 
+            Section("Remove") {
+                Toggle("Also delete local Cleanroom data", isOn: $model.uninstallPurgeData)
+                Text(
+                    "Data includes profiles, recovery journals, and previous-install backups. Leave this off to keep them."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Button("Uninstall Cleanroom…", role: .destructive) {
+                    model.presentingUninstallConfirmation = true
+                }
+            }
+
             Section("Build") {
                 LabeledContent("Version", value: model.appVersion)
                 LabeledContent(
@@ -946,5 +1041,31 @@ private struct CleanroomSettingsView: View {
         }
         .formStyle(.grouped)
         .padding(20)
+        .alert(
+            "Move leftover copies to Trash?",
+            isPresented: $model.presentingLeftoverRemovalConfirmation
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Move to Trash", role: .destructive) { model.removeLeftoverCopies() }
+        } message: {
+            Text(
+                "This removes extra Cleanroom copies under ~/Applications. The copy in /Applications is kept."
+            )
+        }
+        .alert("Uninstall Cleanroom?", isPresented: $model.presentingUninstallConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Uninstall", role: .destructive) { model.uninstallCleanroom() }
+        } message: {
+            Text(uninstallConfirmationMessage(purgeData: model.uninstallPurgeData))
+        }
     }
+}
+
+private func uninstallConfirmationMessage(purgeData: Bool) -> String {
+    let base =
+        "This unregisters the background agent and login item, moves Cleanroom copies to Trash, and quits."
+    if purgeData {
+        return base + " Local profiles, recovery journals, and Application Support data will also be deleted."
+    }
+    return base + " Local profiles and recovery data are kept."
 }

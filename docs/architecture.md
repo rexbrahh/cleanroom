@@ -17,7 +17,13 @@ re-registration if the job is gone; all XPC calls are time-bounded so a dead
 agent cannot wedge clients. The CLI and app use one per-user Mach service;
 neither process mutates cleanroom state directly. The menu app can register
 itself as a login item independently; that setting does not change the
-recovery agent's registration or state.
+recovery agent's registration or state. The supported bundle path is
+`/Applications/Cleanroom.app`. A persisted launch-at-login preference rebinds
+that running copy when Service Management reports it unbound, and a Repair
+card remains after first-run setup for leftover `~/Applications` copies,
+Login Items approval, and an unreachable agent. Uninstall unregisters the
+helper and login item before any bundle is removed; local Application Support
+data is kept unless the operator asks to purge it.
 
 ## Safety invariants
 

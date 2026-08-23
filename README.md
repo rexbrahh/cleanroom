@@ -40,10 +40,22 @@ swift test
 ./scripts/install.sh
 ```
 
-Open `~/Applications/Cleanroom.app` once. The menu-bar app registers its
+Open `/Applications/Cleanroom.app` once. The menu-bar app registers its
 per-user background agent and then watches for Roblox automatically. The
-installer also exposes `~/bin/cleanroomctl` for status, preflight, recovery,
-and bounded diagnostics.
+installer writes that system Applications path by default and fails instead of
+falling back to `~/Applications`. Leftover user-space copies are reported in
+the Repair card. The installer also exposes `~/bin/cleanroomctl` for status,
+preflight, recovery, and bounded diagnostics.
+
+Uninstall unregisters the helper and login item first, then removes
+`/Applications/Cleanroom.app`, leftover `~/Applications` copies, and the CLI
+link. Local profiles stay unless you pass `--purge-data` or enable **Also
+delete local Cleanroom data** in Settings:
+
+```sh
+./scripts/uninstall.sh
+./scripts/uninstall.sh --purge-data
+```
 
 Useful commands:
 
@@ -117,8 +129,9 @@ the app, CLI, and agent do not all report the injected identity.
 Stable tags use `vMAJOR.MINOR.PATCH`; beta releases use
 `vMAJOR.MINOR.PATCH-beta.NUMBER`. Packaging emits schema-validated stable or
 beta metadata and verifies the archive checksum before publication. The
-installer preserves the previous bundle; `scripts/rollback-app.sh` swaps an
-exact verified previous bundle back atomically. Developer ID signing is set by
+installer preserves the previous bundle under Application Support;
+`scripts/rollback-app.sh` swaps an exact verified previous bundle back
+atomically. Developer ID signing is set by
 `CLEANROOM_SIGN_IDENTITY`. Notarization is deliberately credential-gated by
 `CLEANROOM_NOTARY_PROFILE`; set `CLEANROOM_REQUIRE_NOTARIZATION=1` to make a
 missing credential fail packaging rather than produce an explicitly
